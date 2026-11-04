@@ -8,7 +8,7 @@ import pandas as pd
 from scipy.spatial import cKDTree
 
 from .adsb import Trace
-from .doppler import speed_of_sound
+from .doppler import propagation_delay, speed_of_sound
 from .geo import lla_to_enu, enu_to_lla
 
 
@@ -52,13 +52,15 @@ class Segment:
 
 
 def build_segments(traces: list[Trace], lat0: float, lon0: float, dt: float = 1.0, min_len: int = 20,
-                   clip_enu: tuple[float, float, float, float] | None = None) -> list[Segment]:
+                   clip_enu: tuple[float, float, float, float] | None = None,
+                   interp: str = "linear") -> list[Segment]:
     """1 Hz ENU segments. clip_enu=(e_min, e_max, n_min, n_max) keeps only the parts of a
-    track inside that box (split where it leaves), which bounds memory in cpa_table."""
+    track inside that box (split where it leaves), which bounds memory in cpa_table.
+    interp: "linear" or "hermite" (velocity-aware, see Trace.resample)."""
     segs = []
     for i, tr in enumerate(traces):
         for sl in tr.segments():
-            t, enu = tr.enu(sl, lat0, lon0, dt)
+            t, enu = tr.enu(sl, lat0, lon0, dt, method=interp)
             if len(t) < min_len or not np.all(np.isfinite(enu)):
                 continue
             vel = np.gradient(enu, t, axis=0)
@@ -77,9 +79,10 @@ def build_segments(traces: list[Trace], lat0: float, lon0: float, dt: float = 1.
 
 
 def cpa_table(grid: Grid, segs: list[Segment], max_range_m: float = 10000.0, c: float | None = None,
-              chunk: int = 20000) -> pd.DataFrame:
+              chunk: int = 20000, wind=None) -> pd.DataFrame:
     """For every (grid point, segment) within max_range: CPA emission time, heard time,
-    slant distance and ground-track speed at CPA."""
+    slant distance and ground-track speed at CPA. wind=(east, north) m/s delays or advances
+    the heard time along the ray (see doppler.propagation_delay)."""
     c = speed_of_sound() if c is None else c
     rows = []
     tree = cKDTree(grid.enu[:, :2])
@@ -112,9 +115,10 @@ def cpa_table(grid: Grid, segs: list[Segment], max_range_m: float = 10000.0, c: 
             ok = (r <= max_range_m) & (j > 0) & (j < len(s.t) - 1)     # interior CPA only
             if not ok.any():
                 continue
+            tau = r[ok] / c if wind is None else propagation_delay(s.enu[j[ok]] - grid.enu[idx[ok]], c, wind)
             rows.append(pd.DataFrame({
                 "gidx": idx[ok].astype(np.int32), "seg": np.int32(si),
-                "t_emit": s.t[j[ok]], "t_heard": s.t[j[ok]] + r[ok] / c,
+                "t_emit": s.t[j[ok]], "t_heard": s.t[j[ok]] + tau,
                 "d": r[ok].astype(np.float32), "v": s.speed[j[ok]].astype(np.float32),
             }))
     if not rows:
@@ -143,28 +147,67 @@ def load_cpa_table(path, fingerprint: dict) -> pd.DataFrame | None:
     return pd.DataFrame({k: z[k] for k in CPA_COLUMNS})
 
 
-def pair_candidates(cpa: pd.DataFrame, dt_offset: float, tol_s: float = 6.0,
-                    v1=(0, 1e9), d1=(0, 1e9), v2=(0, 1e9), d2=(0, 1e9),
-                    silence_d_m: float | None = 6000.0, silence_margin_s: float = 40.0) -> pd.DataFrame:
-    """Grid points that hear an event-1-like CPA then, dt_offset later, an event-2-like CPA.
-
-    The join is on (grid point, time bucket) rather than grid point alone: a grid point in a
-    busy region hears hundreds of flights a day, and the unconstrained per-point cross product
-    is billions of rows before the time filter. Buckets of width 2*tol_s with a +-1 bucket
-    overlap find exactly the pairs within tol_s."""
-    a = cpa[(cpa.v.between(*v1)) & (cpa.d.between(*d1))]
-    b = cpa[(cpa.v.between(*v2)) & (cpa.d.between(*d2))]
+def _offset_join(a: pd.DataFrame, b: pd.DataFrame, dt_offset: float, tol_s: float) -> pd.DataFrame:
+    """(grid point, a-row, b-row) where b is heard dt_offset +- tol_s after a."""
     w = 2.0 * tol_s
     a = a.assign(key=np.floor(a.t_heard.to_numpy() / w).astype(np.int64))
     kb = np.floor((b.t_heard.to_numpy() - dt_offset) / w).astype(np.int64)
     parts = [a.merge(b.assign(key=kb + off), on=["gidx", "key"], suffixes=("1", "2")) for off in (-1, 0, 1)]
     m = pd.concat(parts, ignore_index=True).drop(columns="key")
-    m = m[(m.seg1 != m.seg2) & ((m.t_heard2 - m.t_heard1 - dt_offset).abs() <= tol_s)].copy()
+    return m[(m.seg1 != m.seg2) & ((m.t_heard2 - m.t_heard1 - dt_offset).abs() <= tol_s)].copy()
+
+
+def _stage(m: pd.DataFrame) -> dict:
+    return {"triples": int(len(m)), "points": int(m.gidx.nunique()) if len(m) else 0,
+            "pairs": int(len(m[["seg1", "seg2"]].drop_duplicates())) if len(m) else 0}
+
+
+def offset_only_stage(cpa: pd.DataFrame, dt_offset: float, tol_s: float, chunk_points: int = 20000) -> dict:
+    """Funnel stage 1 as the video counts it: points that hear *any* two flights dt_offset
+    apart, before speed, distance or silence. Joined in blocks of grid points so the
+    intermediate table stays small even when this stage keeps most of the region."""
+    g = cpa.gidx.to_numpy()
+    out = {"triples": 0, "points": 0}
+    pairs = set()
+    for g0 in range(0, int(g.max()) + 1 if len(g) else 0, chunk_points):
+        sub = cpa[(g >= g0) & (g < g0 + chunk_points)]
+        if not len(sub):
+            continue
+        m = _offset_join(sub, sub, dt_offset, tol_s)
+        out["triples"] += int(len(m)); out["points"] += int(m.gidx.nunique())
+        pairs.update(zip(m.seg1.tolist(), m.seg2.tolist()))
+    out["pairs"] = len(pairs)
+    return out
+
+
+def pair_candidates(cpa: pd.DataFrame, dt_offset: float, tol_s: float = 6.0,
+                    v1=(0, 1e9), d1=(0, 1e9), v2=(0, 1e9), d2=(0, 1e9),
+                    silence_d_m: float | None = 6000.0, silence_margin_s: float = 40.0,
+                    funnel: dict | None = None) -> pd.DataFrame:
+    """Grid points that hear an event-1-like CPA then, dt_offset later, an event-2-like CPA.
+
+    The join is on (grid point, time bucket) rather than grid point alone: a grid point in a
+    busy region hears hundreds of flights a day, and the unconstrained per-point cross product
+    is billions of rows before the time filter. Buckets of width 2*tol_s with a +-1 bucket
+    overlap find exactly the pairs within tol_s.
+
+    funnel: pass a dict to have it filled with the filter funnel the video reports (points,
+    triples and flight pairs after each stage): "offset" (any two flights at the offset; the
+    costly one, computed only when the dict has offset=True), "speed_distance" and "silence"."""
+    if funnel is not None and funnel.pop("offset", False):
+        funnel["offset"] = offset_only_stage(cpa, dt_offset, tol_s)
+    a = cpa[(cpa.v.between(*v1)) & (cpa.d.between(*d1))]
+    b = cpa[(cpa.v.between(*v2)) & (cpa.d.between(*d2))]
+    m = _offset_join(a, b, dt_offset, tol_s)
+    if funnel is not None:
+        funnel["speed_distance"] = _stage(m)
     if silence_d_m is not None and len(m):
         near = cpa[(cpa.d <= silence_d_m) & cpa.gidx.isin(m.gidx.unique())][["gidx", "seg", "t_heard"]]
         x = m[["gidx", "seg1", "seg2", "t_heard1", "t_heard2"]].reset_index().merge(near, on="gidx")
         bad = x[(x.seg != x.seg1) & (x.seg != x.seg2) & (x.t_heard > x.t_heard1 + silence_margin_s) & (x.t_heard < x.t_heard2 - silence_margin_s)]
         m = m.drop(index=bad["index"].unique())
+    if funnel is not None:
+        funnel["silence"] = _stage(m)
     return m.reset_index(drop=True)
 
 

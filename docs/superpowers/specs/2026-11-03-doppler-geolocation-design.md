@@ -83,7 +83,10 @@ DEM   ──► ground elevation per candidate
 - `terrain.py` — cached Terrarium tile elevation lookup.
 - `search.py` — candidate generation, pairing, silence filter.
 - `score.py` — curve placement and locked two-event scoring.
-- `cli.py` — `dopplertrack spectrogram|fit|validate|search`.
+- `weather.py` — sound speed from temperature, wind, optional ERA5 lookup (added later).
+- `privacy.py` — `audit` (detected flyovers against a time-reversed chance level) and `scrub` (added later).
+- `export.py` — GeoJSON / KML / HTML candidates with Street View links (added later).
+- `cli.py` — `dopplertrack spectrogram|fit|detect|search|refine|search-single|explain|trace-line|audit|scrub|export|plot`.
 
 ## Validation plan
 

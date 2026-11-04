@@ -59,3 +59,19 @@ def plot_score_map(res, truth=None, ax=None, top=None, s=6):
         ax.plot(truth[1], truth[0], "r+", ms=14, mew=2, label="truth"); ax.legend()
     ax.set_xlabel("lon"); ax.set_ylabel("lat"); ax.set_aspect(1 / np.cos(np.radians(best.lat.mean())))
     return ax
+
+
+def plot_pair_scores(res, top=30, ax=None):
+    """Best score of each flight pair (or flight), highest first: the video's view of the
+    survivors grouped by pair, where the right pair stands clear of the rest."""
+    ax = ax or plt.gca()
+    key = ["icao1", "icao2"] if "icao1" in res.columns else ["icao"]
+    best = res.sort_values("score", ascending=False).drop_duplicates(key).head(top)
+    labels = ["/".join(str(best.iloc[i][k]) for k in key) for i in range(len(best))]
+    ax.bar(range(len(best)), best.score.to_numpy(), color=["#d62728"] + ["#4477aa"] * (len(best) - 1))
+    ax.set_xticks(range(len(best)), labels, rotation=90, fontsize=7)
+    ax.set_ylabel("best score"); ax.set_title(f"best score per flight {'pair' if len(key) == 2 else ''} (top {len(best)})")
+    if len(best) > 1:
+        m = (best.score.iloc[0] - best.score.iloc[1]) / abs(best.score.iloc[1]) * 100
+        ax.text(0.99, 0.95, f"margin {m:.1f} %", transform=ax.transAxes, ha="right", va="top")
+    return ax

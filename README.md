@@ -80,6 +80,28 @@ uv run dopplertrack search-single rec.npz --event ev_faint.json --traces traces_
     --bbox 40.4 41.3 -74.4 -72.6 --harmonics 2 --v-tol 1.0 --d-tol 0.05 20 --out single.csv
 ```
 
+More commands, each covering a step the video does by hand or discusses:
+
+```bash
+# the video's "Building the Doppler Curve, Step by Step" panel for one flight, observer and time
+uv run dopplertrack explain --traces traces_ny.npz --icao ace391 --point 40.876466 -73.524951 \
+    --utc 2026-09-08T21:08:43 --f0 104 --plot panel.png
+# score a faint curve by its distance from a traced line, as the video does
+uv run dopplertrack trace-line rec.npz ev_faint.json              # automatic ridge, reliable frames only
+uv run dopplertrack trace-line rec.npz ev_faint.json --csv my_trace.csv --harmonic 2   # or a hand-traced line
+uv run dopplertrack search-single ... --score line
+# the filter funnel the video reports, weather, turn-aware trajectories, baro datum
+uv run dopplertrack search ... --funnel --temp 24 --wind 4 200 --interp hermite --calibrate-baro
+# look at the answer: Street View links for every candidate, and the figures
+uv run dopplertrack export results.csv candidates.html --truth 40.876466 -73.524951
+uv run dopplertrack plot pairs pairs.png --results results.csv
+uv run dopplertrack plot candidate cand.png --spec rec.npz --results results.csv --events ev1.json ev2.json \
+    --traces traces_ny.npz --bbox 40.4 41.3 -74.4 -72.6 --harmonics 2 1
+# countermeasures: does a recording leak, and remove the leak
+uv run dopplertrack audit rec.npz --band 60 300 --out leaks.json
+uv run dopplertrack scrub recording.mp4 clean.wav --events leaks.json --band 60 300
+```
+
 `search --point LAT LON` scores a single known location instead of a grid,
 which is the quickest way to validate the data and physics on a recording
 whose location you already know. `detect` prints a ranked table of
@@ -245,6 +267,121 @@ What the ridge score does give is a score in [0, 1] with a meaning (the
 share of the measured curve the candidate explains) and a per-frame
 residual, which is the raw material for an uncertainty estimate.
 
+## The video's method, step by step, and where each step lives here
+
+colsto released no code, and the video could not be fetched from this project's build
+environment, so this list was assembled from the narration as quoted, with timestamps, by
+independent re-implementations ([cbonitz/doppler-experiments](https://github.com/cbonitz/doppler-experiments),
+which worked from the full transcript and three screenshots;
+[franken_doppler_finder](https://github.com/Dicklesworthstone/franken_doppler_finder);
+[gwendall/unheard](https://github.com/gwendall/unheard)).
+
+| # | the video | here |
+|---|---|---|
+| 1 | Faint propeller tones (blade-pass, ~50-150 Hz) make a falling S-curve in a spectrogram, usually inaudible | `spectrogram` (whitened per bin), `detect` |
+| 2 | An interactive panel builds the curve step by step: reception time 25.00 s, solve t_r = t_e + r(t_e)/c for t_e = 16.910 s, position, velocity, r = 2775 m, v_r = 121.16 m/s, f = 130 x 343/(343 + 121.16) = 96.07 Hz | `explain` prints the same steps for a real flight; `doppler.explain` reproduces the panel's numbers exactly (`tests/test_video_methods.py`) |
+| 3 | Using the radial speed at reception time instead of emission time "makes an entirely wrong curve" | `curve_from_trajectory(..., model="reception")`, shown by `explain --plot`; never used for scoring |
+| 4 | Read the curve by hand: the drop gives speed, its steepness the CPA distance, its midpoint the heard CPA time; then "generous ranges" | `fit` (automatic), `--v-tol`, `--d-tol` |
+| 5 | Historical ADS-B (a paid Flightradar24 API), jets dropped | `fetch-day` (free adsb.lol), ICAO Doc 8643 engine classes |
+| 6 | For every flight, a 200 m grid over a corridor around its track: CPA and the sound-delayed heard CPA time | `search` (`cpa_table`, KD-tree corridor) |
+| 7 | Filters: the offset between the two events (920 s), speed and distance, then silence (no other plane heard in between); the video reports how many points survive each | `pair_candidates`; `search --funnel` prints the same funnel |
+| 8 | Survivors grouped by flight pair; exact curves from the real, turning track; event 2 locked to event 1's clock; one pair scores far above the rest | locked scoring; `plot pairs` |
+| 9 | Turns, speed and altitude changes are encoded in the curve and break ambiguities | real trajectories; `--interp hermite` makes turns between ADS-B reports curve (see below) |
+| 10 | The 200 m grid is "a little too coarse": the right answer can be 141 m off and score badly | `refine` (50 m) |
+| 11 | Street View at the best point shows the camera's surroundings | `export` (GeoJSON, KML, HTML map, each point with a Street View link) |
+| 12 | A second example: one faint ~60 s flyover with a known time, scored by distance from a traced line | `search-single`; `--score line` with `trace-line` (hand-traced CSV or the automatic ridge) |
+| 13 | Countermeasures: a high-pass filter does not help (boosting brings it back); talking over it does not; it survives phone-call compression | `audit`, `scrub`; the claims are checked in `tests/test_countermeasures.py` |
+| 14 | Still air, c = 343 m/s | `--temp`, `--wind`, `--weather` |
+
+### Added in this round, and what is and is not validated
+
+None of these changes the default behaviour, so every number in Results above is still what
+the defaults give. They are tested on synthetic data with known answers; none has yet been
+run on the two real recordings (the recordings are YouTube uploads and could not be
+downloaded where this was built), so on real data they are options to try, not defaults.
+
+- **`explain`.** The video's step-by-step panel for any flight, observer and reception time,
+  including what the reception-time model would say. On the video's own numbers it gives
+  t_e = 16.910 s, r = 2775 m, v_r = 121.16 m/s and f = 96.07 Hz.
+- **Filter funnel** (`search --funnel`): points, (point, flight, flight) triples and flight
+  pairs after the offset filter alone, after speed and distance, and after silence, the
+  counts the video quotes. The offset-only stage is the expensive one, so it is opt-in.
+- **Recording clock.** Every search and refine row now has `rec_start_unix`, the UTC time of
+  the recording's first sample that the candidate implies.
+- **Turn-aware trajectories** (`--interp hermite`). ADS-B reports arrive every 1-20 s; joined
+  with straight lines, a turning aircraft's velocity is constant between reports and jumps at
+  each one, so the modelled range rate is a staircase. Each readsb report also carries ground
+  speed and true track; using them as the velocity at each report (cubic Hermite in lat/lon,
+  monotone cubic in altitude) makes the path curve the way the aircraft did. On a 1.5 deg/s
+  turn at 60 m/s, with exact speed and track in each report:
+
+  | report interval | linear: position, curve error | hermite: position, curve error |
+  |---|---|---|
+  | 4 s | 3.1 m, 0.48 Hz | 0.06 m, 0.01 Hz |
+  | 8 s | 12.6 m, 1.4 Hz | 0.12 m, 0.02 Hz |
+  | 15 s | 44 m, 3.1 Hz | 0.27 m, 0.03 Hz |
+
+  (100 Hz tone, observer 4 km off the turn.) A 1.4 Hz error is as wide as the ridge score's
+  whole 1.5 % tolerance, so this is the change most likely to matter on turning passes such
+  as the faint N7681Y curve above. Real reports carry quantised and noisy speed and track,
+  so the gain on real data is smaller than this and has to be measured.
+- **Baro datum** (`--calibrate-baro`). Geometric altitude is GNSS height; barometric altitude
+  assumes a standard atmosphere and is off by tens of metres on any non-standard day (76 m on
+  the test trace, QNH 1026 hPa). Aircraft that report both measure the offset; it is fitted per
+  half hour as a + b x baro and applied to aircraft that only report baro.
+- **Weather** (`--temp`, `--wind SPEED FROM_DEG`, `--weather`). The speed of sound follows
+  temperature (0.6 m/s per degree C). A uniform wind is modelled exactly: the sound heard at
+  t_e + tau left when |D + w tau| = c tau (D from observer to aircraft), which gives
+  f = f0 (c - m.w) / (c - m.w + m.v) with m the unit vector along that ray. The obvious shortcut
+  (a direction-dependent sound speed c + w.k with the ray straight) is off by about as much
+  as ignoring the wind, because the ray tilts by about |w|/c and that tilt multiplies the
+  aircraft's speed; the test checks the model against an exact air-frame ray solution. `--weather` reads
+  ERA5 surface temperature and wind from Open-Meteo's free archive and carries them to the
+  middle of the sound path (standard lapse rate, 1/7 power-law wind profile).
+- **Traced-line scoring** (`--score line`, `trace-line`). The video scores its faint curve by
+  distance from a line drawn on the spectrogram. `trace-line` stores a line in the event JSON,
+  from a hand-traced CSV (any tool that exports t, f points) or from the automatic ridge's
+  reliable frames, which a person can then trim; `--score line` scores against it with the
+  ridge score's kernel.
+- **Exports and figures.** `export` writes the best point of each flight pair as GeoJSON, KML
+  or a standalone Leaflet map, each with Google Maps and Street View links, the video's
+  final check. `plot` draws an event fit, the score map, the best score per flight pair, and
+  a candidate's modelled curves over both event windows.
+- **Peak spread.** `refine` prints how many fine points score within 1 % and 5 % of the peak
+  and how far the farthest is: a direct read of how well the events pin the point (tight for
+  a low lateral pass, wide for two overhead ones, as on the eagle cam).
+- **Several trace files** (`--traces day1.npz day2.npz`), for a recording whose UTC day is
+  uncertain or that spans midnight UTC.
+
+### Countermeasures
+
+The video's last part, checked on a synthetic recording (`tests/test_countermeasures.py`):
+
+- A 4th-order high-pass at 200 Hz, above both tones, followed by a 20 dB boost: the fit lands
+  on the same curve. A linear filter scales tone and noise in a frequency bin alike, and the
+  per-bin whitening undoes the scale.
+- A 300-3400 Hz phone band removes a 120 Hz fundamental entirely; its fourth harmonic, at
+  480 Hz, traces the same Doppler factor and fits to the right speed and CPA time.
+
+`audit` reports whether a recording leaks: it runs `detect` and compares each flyover with
+the best score the detector finds in the *time-reversed* spectrogram. A Doppler curve only
+ever falls, so reversed it is a rising curve the model cannot fit, while noise, bursts, hum
+and speech look the same either way; the reversed best is the level chance reaches in that
+recording. Two flyovers above it is "high" (enough for a blind two-event search), one is
+"medium" (enough with a known time). `detect --null` prints the same chance level.
+
+`scrub` removes the leak from the audio of a given list of events (`audit --out` writes
+one). In the default `fill` mode the short-time spectrum along every harmonic of each curve,
+up to 1.5 kHz, is replaced by that bin's own noise floor with random phase. Zeroing the bins
+instead would leave a dark curve of the same shape, which leaks just as much. `mute` silences
+each event window and `cut` deletes it, which also destroys the time between events the
+two-event search depends on. Only the events passed in are removed, and a detected fit
+can be far enough off the real tone that the mask misses it (on the synthetic recording
+`detect` fitted one flyover at 103 Hz and 44 m/s, where the tone was 120 Hz at 110 m/s), so
+`scrub --band FLO FHI` audits its own output, which fits the remaining tones afresh, and
+scrubs whatever is still above chance, up to `--passes` more times. On that recording
+the risk went from high to medium after the first pass and to low after the second.
+
 ## Changes from the method in the video
 
 The physics and the search strategy are the author's. What differs:
@@ -290,6 +427,7 @@ by flight geometry.
 | Historical ADS-B | adsb.lol `globe_history_YYYY` GitHub releases (~4 GB/day) |
 | Aircraft engine class | OpenSky mirror of ICAO Doc 8643 |
 | Elevation | AWS Terrain Tiles (Terrarium) |
+| Weather (optional) | Open-Meteo ERA5 archive |
 
 ## Development
 

@@ -1,7 +1,7 @@
 """Extract a Doppler event from a spectrogram window and fit the ideal model."""
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 import numpy as np
 from scipy.optimize import minimize
@@ -22,9 +22,16 @@ class EventFit:
     score: float        # mean whitened dB along the fitted curve
     f_pre: float
     f_post: float
+    # optional traced line of the fundamental, [[t, f], ...] (recording s, Hz): written by
+    # `dopplertrack trace-line` from the automatic ridge or a hand-traced CSV, scored by
+    # score mode "line" (the video scores its faint curve by distance from such a line)
+    line: list | None = field(default=None, repr=False)
 
     def to_dict(self):
-        return asdict(self)
+        d = asdict(self)
+        if d["line"] is None:
+            del d["line"]
+        return d
 
 
 def local_whiten(sp: Spectrogram, floor: float = 0.0) -> Spectrogram:
