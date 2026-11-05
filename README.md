@@ -1,5 +1,7 @@
 # dopplertrack
 
+![An hour of outdoor recording: three propeller aircraft, none audible, each matched by the Doppler curve its real ADS-B track predicts at the true location](docs/results/header.png)
+
 Acoustic geolocation from the Doppler curves of propeller aircraft.
 
 Any outdoor (and many indoor) recordings contain faint, usually inaudible
@@ -13,53 +15,48 @@ predicts a different curve, and the recording picks out the one that matches.
 This is a reimplementation of the technique shown in colsto's video
 ["I discovered a sound that leaks your exact location"](https://www.youtube.com/watch?v=UytYrhYLOKI).
 No code was released with that video; this project is an open, automatic
-version of the method. See `docs/superpowers/specs/` for the design.
+version of the method, with the search extended from a hand-drawn box to a
+whole continent.
 
 ## Status
 
-Proof of concept, validated on two recordings with known answers. On the
-author's reference recording (Oyster Bay, NY, 2026-09-08) a blind search
-over a 100 x 150 km region ranks the true location first, 43 m off after
-refinement. On a 12-hour public eagle-cam stream (North Fort Myers, FL,
-2024-12-28), with the flyovers found automatically, the search ranks the
-right pair of flights first of 607 and places the camera within 600 m.
-See Results below.
+Validated on two recordings with known answers: the video author's one-hour
+reference clip (Oyster Bay, NY, 2026-09-08) and a 12-hour public eagle-cam
+stream (North Fort Myers, FL, 2024-12-28). Both are searched against every
+propeller flight over the continental US that day, with no region given.
 
-## Pipeline
+| | Oyster Bay | eagle cam |
+|---|---|---|
+| flights that day, CONUS | 35,427 | 13,046 |
+| flight pairs scored | 9,669 | 13,298 |
+| rank of the true pair, two events | **1** | 15 |
+| rank with further detected flyovers (`--extra`) | 1 | **1** |
+| best point from the truth | 32 m | 627 m |
+| margin over the runner-up | 24 % | 13 % |
+| verdict (p) | located (0.001) | located (0.06) |
+| verdict from the two events alone | ambiguous (0.23) | ambiguous (0.48) |
+| wall time, 16 threads, after the index | 18 min | 6 min |
 
-1. `spectrogram` — decode any audio/video with ffmpeg, high-resolution STFT of
-   the 40–450 Hz band, whitened per frequency bin so only *changing* tones stand out.
-2. `detect` — find the flyovers without a person: slide a window over the
-   whole recording, grid-search an ideal straight-pass Doppler curve
-   (f0, speed, CPA slant distance, CPA time) in each, keep the local maxima,
-   refine them and rank them. `fit` does the same for one window you choose.
-   `detect` scores a sweep-weighted ridge contrast, which ignores bursts and
-   steady tones but gives the flat ends of a curve little weight; `fit` scores
-   the plain mean brightness under the curve, as the results below were fitted
-   (`--objective contrast` switches it to the detector's score).
-   The curve parameters only seed a search with coarse ranges.
-3. `fetch-day` — stream one day's [adsb.lol](https://github.com/adsblol/globe_history_2026)
-   archive straight from GitHub (4 GB, nothing written to disk) and keep the
-   flights that touched a bounding box, dropping known jets using ICAO Doc
-   8643 engine classes. `extract-region` does the same from an archive you
-   already have on disk.
-4. `search` — for every grid point (200 m) and every flight, compute the
-   closest point of approach (CPA), its slant distance (using a DEM for the
-   observer's elevation) and the *heard* CPA time (propagation delay). Keep
-   points that hear an event-1-like pass, then exactly Δt later an
-   event-2-like pass, with no other prop flight in between. Model the exact
-   Doppler curve each survivor would hear from the real trajectory
-   (emission-time radial velocity) and score it against the spectrogram.
-   Event 1's placement absorbs measurement error; event 2's placement is
-   locked to the flight geometry. `--score ridge` scores how closely the
-   modelled curve follows the ridge traced in the window instead of the
-   brightness under it (see "Ridge score" below); `--v-tol` and `--d-tol`
-   open the speed and distance gates when the fit of a faint or turning
-   pass cannot be trusted.
-5. `refine` — 50 m grid around a winning candidate. Further detected
-   flyovers can be added here: each is matched to a flight once, at the
-   candidate, then scored at every fine point with the same time shift as
-   event 1, so every event is locked to one clock.
+A third recording, 12 hours from a railway camera in Atlanta searched the
+same way, is a negative: every pair of real flyovers puts the camera within
+440 m and in the top 6–32 of tens of thousands of pairs, and none wins,
+because the modelled curve of the true track has a kink the audio lacks and
+a smoother track elsewhere fits better. Its archived stream had also lost
+107 s in the middle, which put the extra flyovers on a different clock. The
+details and what they add to the roadmap are in the experiments page.
+
+Two flyovers locate a recording when at least one passed low and to the side;
+two high, nearly overhead passes leave a plateau a few kilometres wide and a
+continent full of pairs that fit, which is what the extra flyovers are for.
+A margin is not a confidence: a box that does not contain the answer still
+returns a winner. So every search ends with a verdict: the winner is judged
+against the thousands of wrong pairs the same search scored on the same
+audio, and p is the chance a wrong winner would lead the next wrong pair by
+that much. The audio searched in a box 150 km from the answer gets
+"no match" (p = 0.88); of twenty searches of the railcam audio with no right
+answer among the pairs, two were called located, so p < 0.1 is a weak claim. The experiments behind these numbers, the regional
+searches that came first, and the failures along the way are in
+[docs/experiments.md](docs/experiments.md).
 
 ## Usage
 
@@ -69,498 +66,130 @@ uv run dopplertrack spectrogram recording.mp4 rec.npz
 uv run dopplertrack detect rec.npz --band 60 300 --top 10 --out detected.json
 uv run dopplertrack fit rec.npz --window 2090 2200 --band 95 200 --harmonics 2 --out ev1.json
 uv run dopplertrack fit rec.npz --window 3020 3130 --band 95 195 --out ev2.json
-uv run dopplertrack fetch-day 2026-09-08 traces_ny.npz --bbox 40.4 41.3 -74.4 -72.6
-uv run dopplertrack search rec.npz --events ev1.json ev2.json --traces traces_ny.npz \
-    --bbox 40.4 41.3 -74.4 -72.6 --spacing 200 --harmonics 2 1 --out results.csv
-uv run dopplertrack refine rec.npz results.csv --events ev1.json ev2.json --traces traces_ny.npz \
-    --bbox 40.4 41.3 -74.4 -72.6 --harmonics 2 1 --extra ev3.json ev4.json --out fine.csv
-# one faint flyover whose heard-CPA time is known (here 20:40:58 UTC), gates opened wide
-uv run dopplertrack fit rec.npz --window 1375 1465 --band 70 105 --harmonics 2 --out ev_faint.json
-uv run dopplertrack search-single rec.npz --event ev_faint.json --traces traces_ny.npz --utc 1788900058.6 \
-    --bbox 40.4 41.3 -74.4 -72.6 --harmonics 2 --v-tol 1.0 --d-tol 0.05 20 --out single.csv
+uv run dopplertrack fetch 2026-09-08 day.npz --bbox 24 50 -125 -66          # one index per day, reused by every search
+uv run dopplertrack search rec.npz --events ev1.json ev2.json --day day.npz --harmonics 2 1 \
+    --cands cands.npz --extra ev3.json ev4.json --out results.csv
+uv run dopplertrack refine rec.npz results.csv --events ev1.json ev2.json --day day.npz \
+    --harmonics 2 1 --extra ev3.json ev4.json --out fine.csv
 ```
 
-More commands, each covering a step the video does by hand or discusses:
+- `spectrogram` decodes any audio or video with ffmpeg and whitens a
+  high-resolution STFT of the 40–450 Hz band per frequency bin, so only
+  changing tones stand out.
+- `detect` finds the flyovers: an ideal straight-pass Doppler curve (f0,
+  speed, CPA distance, CPA time) is grid-searched in a sliding window and the
+  local maxima are refined and ranked. `fit` does the same in one window you
+  choose. Either writes event JSON that `search` takes as it is.
+- `fetch` streams one day of [adsb.lol](https://github.com/adsblol/globe_history_2026)
+  history from GitHub (4 GB, nothing stored), drops known jets, and writes the
+  day index a search runs on: every flight resampled to 1 Hz in one
+  Earth-centred frame, plus a sample per flight per 10 s. `--bbox` limits it
+  to a region, `--archive DIR` reads an archive already on disk.
+- `search` ranks (location, flight pair) candidates over the index, see
+  below. `--bbox` restricts it to a region, `--point LAT LON` scores one
+  known location (the quickest check on a recording whose answer you know),
+  and one event with `--utc TIME` searches a single flyover whose time is
+  known. `--cands` caches the candidate table, so a change to the scorer
+  reruns only the scoring. `--extra` rescores the best pairs with further
+  flyovers.
+- `refine` lays a 50 m grid around one result, optionally with more events.
+
+Around those six, tools for the rest of the video's workflow and its countermeasures
+(details, and how each did on real data, in [docs/video-method.md](docs/video-method.md)):
 
 ```bash
 # the video's "Building the Doppler Curve, Step by Step" panel for one flight, observer and time
-uv run dopplertrack explain --traces traces_ny.npz --icao ace391 --point 40.876466 -73.524951 \
+uv run dopplertrack explain --day day.npz --icao ace391 --point 40.876466 -73.524951 \
     --utc 2026-09-08T21:08:43 --f0 104 --plot panel.png
 # score a faint curve by its distance from a traced line, as the video does
-uv run dopplertrack trace-line rec.npz ev_faint.json              # automatic ridge, reliable frames only
-uv run dopplertrack trace-line rec.npz ev_faint.json --csv my_trace.csv --harmonic 2   # or a hand-traced line
-uv run dopplertrack search-single ... --score line
-# the filter funnel the video reports, weather, turn-aware trajectories, baro datum
-uv run dopplertrack search ... --funnel --temp 24 --wind 4 200 --interp hermite --calibrate-baro
+uv run dopplertrack trace-line rec.npz ev_faint.json --csv my_trace.csv --harmonic 2
+uv run dopplertrack search rec.npz --events ev_faint.json --utc 1788900058.6 --day day.npz --score line --out single.csv
+# the atmosphere: per-ray sound speed from the hour's temperature profile, and wind
+uv run dopplertrack search ... --weather          # or --temp 24 --lapse, --wind 4 200
+# paths that curve between ADS-B reports, baro-only altitudes on the GNSS datum
+uv run dopplertrack fetch 2026-09-08 day.npz --bbox 40.4 41.3 -74.4 -72.6 --interp hermite --calibrate-baro
 # look at the answer: Street View links for every candidate, and the figures
 uv run dopplertrack export results.csv candidates.html --truth 40.876466 -73.524951
-uv run dopplertrack plot pairs pairs.png --results results.csv
-uv run dopplertrack plot candidate cand.png --spec rec.npz --results results.csv --events ev1.json ev2.json \
-    --traces traces_ny.npz --bbox 40.4 41.3 -74.4 -72.6 --harmonics 2 1
-# countermeasures: does a recording leak, and remove the leak
+uv run dopplertrack plot candidate cand.png --spec rec.npz --results results.csv --events ev1.json ev2.json --day day.npz
+# does a recording leak its location, and remove the leak
 uv run dopplertrack audit rec.npz --band 60 300 --out leaks.json
 uv run dopplertrack scrub recording.mp4 clean.wav --events leaks.json --band 60 300
 ```
 
-`search --point LAT LON` scores a single known location instead of a grid,
-which is the quickest way to validate the data and physics on a recording
-whose location you already know. `detect` prints a ranked table of
-candidate flyovers; `--out` writes them as a JSON list whose entries can be
-passed to `search --events` as they are.
+Heights: ADS-B geometric altitude is height above the WGS-84 ellipsoid and terrain is height
+above sea level, so `search`, `refine` and `fetch` put observers (and baro-only aircraft) on
+the ellipsoid with the EGM96 geoid (about 33 m around New York). `--no-geoid` restores the
+datum the published results used.
 
-## Results
+## How the search works
 
-Reference recording: colsto's raw one-hour clip
-([youtu.be/4CxVxuMVkMc](https://youtu.be/4CxVxuMVkMc)), made 2026-09-08 in
-Oyster Bay, NY at 40.876466, -73.524951, the answer given in the video. Only
-the recording date and the search region were used as inputs; the clip's
-start time (20:17:30 UTC) and the two aircraft fall out of the search.
+1. **Join.** Two events heard Δt apart at fitted slant distances d1 and d2
+   mean the two aircraft were within d1 + d2 of each other, Δt apart in
+   emission time (give or take the propagation delays). That is a join over
+   the day's 10 s samples with KD-trees, speed-gated, and it leaves a few
+   tens of thousands of flight pairs out of hundreds of millions.
+2. **Lens.** For each pair, ground points are laid only where both flights
+   could have been heard: a 1 km lattice first, then 200 m where it passes.
+   Every point gets the exact closest point of approach to each real
+   trajectory: slant distance (with a DEM for the observer's elevation),
+   speed, and the *heard* CPA time. Points must hear an event-1-like pass,
+   then exactly Δt later an event-2-like pass, with no other propeller
+   flight within 6 km in between.
+3. **Score.** The Doppler curve each survivor would hear is modelled from the
+   real trajectory (emission-time radial velocity) and scored against the
+   spectrogram. Event 1's placement is swept over small time shifts and f0
+   scales, which absorb measurement error; event 2 is placed with the same
+   shift, locked to the flight geometry. Score = brightness under both curves.
+4. **More events.** For the best pairs, each further flyover is matched to a
+   flight at the pair's best point and scored at all of its points with that
+   point's shift, so every event is on one clock. `refine` does the same on
+   a fine grid.
+5. **Verdict.** At most one scored pair is right; the rest are the null
+   distribution for this recording. The upper tail of their scores is fitted
+   as exponential, and the gap between the winner and the best other pair is
+   tested against it: located (p < 0.1), ambiguous (p < 0.5), or no match.
 
-**Known-point check.** Scoring the true location against every non-jet flight
-of the day (1,016 traces touching the region) leaves exactly one pair that
-passes the 918 s offset and silence filters: N22NY, a Pilatus PC-12 at 6.1 km,
-heard CPA 20:53:25 UTC, and N93CQ, a King Air 350 at 3.6 km, 21:08:43 UTC.
-The Doppler curves modelled from their real trajectories lie on the measured
-ridges with no free parameters beyond a half-second time shift:
+The ideal-curve fits only seed the gates (`--v-tol`, `--d-tol`; open them
+for a faint or turning pass); ranking uses real trajectories throughout.
+`--score ridge` scores how closely a curve follows the ridge traced in the
+window instead of the brightness under it.
 
-![Modelled curves at the true point](docs/results/oyster_bay_known_point.png)
-
-**Blind search.** A 200 m grid over a 100 x 150 km box around New York
-(379,758 points, 3,068 airborne flight segments) gives 86 million
-(point, flight) closest approaches and 40,889 candidate (point, pair)
-triples after the filters, from 328 distinct flight pairs. Scoring all of them
-takes 19 minutes on a laptop.
-
-| | |
-|---|---|
-| Rank of the true location's flight pair | 1 of 328 |
-| Top candidate, 200 m grid | 123 m from truth |
-| Refined peak, 50 m grid | 43 m from truth |
-| Margin over the best wrong flight pair | 4.9 % (27.1 vs 25.8) |
-
-![Blind search score map](docs/results/oyster_bay_search.png)
-
-The result is right and the 50 m refinement shows a single clean peak. The
-4.9 % margin over the runner-up pair (flights 70 km away whose geometry
-happens to produce a similar 918 s offset) is thin, because the score only
-measures brightness under the modelled curve, so a wrong pair can score well
-wherever the spectrogram is busy. Numbers:
-`docs/results/oyster_bay_search_best_per_pair.csv` (best score per flight
-pair) and `docs/results/oyster_bay_refined_50m.csv`.
-
-**Automatic event detection.** The two windows above were chosen by eye, as
-in the video. Running `detect` over the whole hour with no hints returns the
-same two flyovers as its top two candidates (CPA 2155.6 s and 3068.4 s,
-scores 15.7 and 10.0; the third candidate scores 9.0). Its own fits of them
-can't stand in for `fit` yet: its event 2 comes out with f0 11 % above what
-the King Air's trajectory needs and the time between the two events 10 s
-short, so the search's ±6 s and ±5 % filters reject the true pair at the true
-location. Finding the flyovers needs no manual input; measuring them for the
-search still uses the two `fit` windows.
-
-### Second recording: a 12-hour eagle cam
-
-To test on something the method was not developed on, we used a public
-livestream archive with a published location: the Southwest Florida Eagle
-Cam in North Fort Myers (nest LE-026B at 26.702359, -81.847766 in Lee
-County's eagle-nest register), the 12-hour archive of 2024-12-28
-([youtu.be/zs2o5Rhlp5w](https://youtu.be/zs2o5Rhlp5w)). It is a harder
-recording: an outdoor microphone in wind, 12 hours long, and 10 km from a
-busy flight-school airport, so prop aircraft pass every few minutes. The
-day's ADS-B was streamed with `fetch-day` (557 non-jet flights touching a
-130 x 130 km box, 4 GB read, nothing stored) and the flyovers were found
-with `detect`: of its top 40 candidates, 20 coincide within 25 s with a
-known prop flight passing within 12 km of the nest.
-
-![Known-point check on the eagle cam](docs/results/swfl_known_point.png)
-
-**Blind search** on two detected events 338 s apart (a Beech Baron at
-2.5 km and a Pilatus PC-12 at 6 km, as it turns out) over the 130 x 130 km
-box: 432,196 points, 1,233 flight segments, 50,682 candidate triples from
-607 flight pairs, 8 minutes.
-
-| | |
-|---|---|
-| Rank of the true flight pair | 1 of 607 |
-| Margin over the best wrong pair | 2.5 % |
-| Top candidate, 200 m grid, two events | 917 m from the nest |
-| Refined peak, 50 m grid, two events | 1.7 km from the nest |
-| Refined peak with three more detected flyovers | 592 m from the nest |
-
-![Eagle cam search](docs/results/swfl_search.png)
-
-The right flights are identified, but two events pin the location only to
-about 2 km here, and the reason is geometry rather than noise: both
-aircraft passed nearly overhead at 2.5 km and 5.7 km altitude, so the slant
-distance that shapes the Doppler curve barely changes as the observer moves
-a kilometre on the ground. At Oyster Bay the King Air passed 3.5 km to the
-side at 1 km altitude, which is why that peak is sharp. Adding three more
-flyovers found by `detect` (`refine --extra`), locked to the same clock,
-brings the peak to 592 m. Lower, lateral passes are what pin a location,
-so the more flyovers a long recording offers, the better. Numbers:
-`docs/results/swfl_search_best_per_pair.csv`, `docs/results/swfl_refined_50m.csv`,
-and the detector's candidates for both recordings in `docs/results/*_detected.json`.
-
-**What this second recording changed.** The first version of the scorer
-averaged brightness only over the part of the window a modelled curve
-covered, so a flight that landed or left the data mid-pass was judged on its
-bright half alone; on the eagle cam that put a pair 64 km away on top. The
-score is now the brightness summed along the curve over the whole measured
-window (uncovered parts count as zero), which fixed the ranking here and
-left the Oyster Bay result unchanged. Scoring the curve against its
-spectral neighbourhood (a contrastive score) was tried as well: it widens
-the Oyster Bay margin but does not help the eagle cam, so it is not in.
-
-### A faint single flyover with a known time
-
-The video's last experiment locates the recording from one faint one-minute
-curve, given its time. The Oyster Bay hour has such a curve at 1375–1465 s:
-a fundamental sweeping 92 to 73 Hz a few dB above the noise, with its second
-harmonic ([`docs/results/oyster_bay_ev_faint.json`](docs/results/oyster_bay_ev_faint.json)).
-The only ADS-B flight passing the true point then is N7681Y, a Piper Twin
-Comanche, whose heard CPA at the true point is 0.9 s from the fitted one.
-Its curve modelled from the real trajectory sits on the faint ridge
-([figure](docs/results/oyster_bay_faint_curve.png)), but the straight-pass
-fit of that ridge says 41 m/s at 750 m where the aircraft was doing 70 m/s
-at 8.2 km: a sharp drop followed by a flat tail reads as a close slow pass,
-and the search's default gates (±35 % in speed, 0.4–2.5× in distance) drop
-the true flight before scoring. With the gates opened (`--v-tol 1.0
---d-tol 0.05 20`), `search-single` over the same 100 x 150 km box and ±30 s
-scores 77,280 (point, flight) pairs from 66 flights:
-
-| score | top point | margin over the next flight | top-20 points on N7681Y | of those within 2 km |
-|---|---|---|---|---|
-| brightness | 1.7 km from the truth, N7681Y | 31.6 % | 20 | 17 |
-| ridge | 2.3 km from the truth, N7681Y | 14.5 % | 20 | 3 |
-
-Tables: [`oyster_bay_single_faint_brightness.csv`](docs/results/oyster_bay_single_faint_brightness.csv),
-[`oyster_bay_single_faint_ridge.csv`](docs/results/oyster_bay_single_faint_ridge.csv).
-Two lessons. A single faint flyover with a known time does locate the
-recording to a couple of kilometres in a box this size, as the video says.
-And the ideal-curve fit is the weak link: on a pass that is not straight it
-is wrong by a factor of ten in distance, so the gates it seeds must be loose
-or, better, replaced by the trajectory-modelled curve itself.
-
-**Ridge score.** For that faint curve the video scores candidates by their
-distance from a hand-traced line rather than by brightness. `--score ridge`
-is the automatic version: a Viterbi ridge is traced through the event
-window once (harmonics are multiples of it), frames are kept only where the
-ridge is bright and at least 3 dB brighter than the best path that avoids
-it (a bird burst or a second tone offers several equally good paths and says
-nothing), and a modelled curve scores the fraction of kept frames it passes
-within 1.5 % in frequency of ([tracks and masks](docs/results/ridge_tracks.png)).
-On the two blind two-event searches it is not an improvement over
-brightness, and it is not the default:
-
-| recording | brightness: true pair rank, margin | ridge: rank, margin |
-|---|---|---|
-| Oyster Bay (328 pairs) | 1, 4.9 % | 1, 4.0 % |
-| eagle cam (607 pairs) | 1, 2.5 % | 4 (1 without the uniqueness mask, 0.6 %) |
-
-Widening the tolerance to 3 % or 5 % or dropping the mask moves the eagle
-cam between rank 1 with no margin and rank 4; the pair it loses to is the
-one brightness ranks second, two aircraft on the same airway whose curves
-differ little. Best-per-pair tables under both scores:
-[`oyster_bay_search_best_per_pair_ridge.csv`](docs/results/oyster_bay_search_best_per_pair_ridge.csv),
-[`swfl_search_best_per_pair_ridge.csv`](docs/results/swfl_search_best_per_pair_ridge.csv).
-What the ridge score does give is a score in [0, 1] with a meaning (the
-share of the measured curve the candidate explains) and a per-frame
-residual, which is the raw material for an uncertainty estimate.
-
-## The video's method, step by step, and where each step lives here
-
-colsto released no code, and the video could not be fetched from this project's build
-environment, so this list was assembled from the narration as quoted, with timestamps, by
-independent re-implementations ([cbonitz/doppler-experiments](https://github.com/cbonitz/doppler-experiments),
-which worked from the full transcript and three screenshots;
-[franken_doppler_finder](https://github.com/Dicklesworthstone/franken_doppler_finder);
-[gwendall/unheard](https://github.com/gwendall/unheard)).
-
-| # | the video | here |
-|---|---|---|
-| 1 | Faint propeller tones (blade-pass, ~50-150 Hz) make a falling S-curve in a spectrogram, usually inaudible | `spectrogram` (whitened per bin), `detect` |
-| 2 | An interactive panel builds the curve step by step: reception time 25.00 s, solve t_r = t_e + r(t_e)/c for t_e = 16.910 s, position, velocity, r = 2775 m, v_r = 121.16 m/s, f = 130 x 343/(343 + 121.16) = 96.07 Hz | `explain` prints the same steps for a real flight; `doppler.explain` reproduces the panel's numbers exactly (`tests/test_video_methods.py`) |
-| 3 | Using the radial speed at reception time instead of emission time "makes an entirely wrong curve" | `curve_from_trajectory(..., model="reception")`, shown by `explain --plot`; never used for scoring |
-| 4 | Read the curve by hand: the drop gives speed, its steepness the CPA distance, its midpoint the heard CPA time; then "generous ranges" | `fit` (automatic), `--v-tol`, `--d-tol` |
-| 5 | Historical ADS-B (a paid Flightradar24 API), jets dropped | `fetch-day` (free adsb.lol), ICAO Doc 8643 engine classes |
-| 6 | For every flight, a 200 m grid over a corridor around its track: CPA and the sound-delayed heard CPA time | `search` (`cpa_table`, KD-tree corridor) |
-| 7 | Filters: the offset between the two events (920 s), speed and distance, then silence (no other plane heard in between); the video reports how many points survive each | `pair_candidates`; `search --funnel` prints the same funnel |
-| 8 | Survivors grouped by flight pair; exact curves from the real, turning track; event 2 locked to event 1's clock; one pair scores far above the rest | locked scoring; `plot pairs` |
-| 9 | Turns, speed and altitude changes are encoded in the curve and break ambiguities | real trajectories; `--interp hermite` makes turns between ADS-B reports curve (see below) |
-| 10 | The 200 m grid is "a little too coarse": the right answer can be 141 m off and score badly | `refine` (50 m) |
-| 11 | Street View at the best point shows the camera's surroundings | `export` (GeoJSON, KML, HTML map, each point with a Street View link) |
-| 12 | A second example: one faint ~60 s flyover with a known time, scored by distance from a traced line | `search-single`; `--score line` with `trace-line` (hand-traced CSV or the automatic ridge) |
-| 13 | Countermeasures: a high-pass filter does not help (boosting brings it back); talking over it does not; it survives phone-call compression | `audit`, `scrub`; the claims are checked in `tests/test_countermeasures.py` |
-| 14 | Still air, c = 343 m/s | `--temp`, `--wind`, `--weather` |
-
-### Added in this round, and what is and is not validated
-
-One of these changes the default: the altitude datum (below), a correction rather than a
-model choice; `--no-geoid` restores the old behaviour, which is how the Results above were
-made. Everything else is opt-in. The flight-data side is checked on real ADS-B
-(`tests/test_real_adsb.py`, offline, and `tests/test_real_day.py` for a whole day); none of
-it has yet been run on the two real recordings, so the options that change the answer are
-not defaults until `tests/test_real_recordings.py` (see Validation below) says they help.
-
-- **Altitude datum (default on).** ADS-B geometric altitude is GNSS height above the WGS-84
-  ellipsoid; terrain tiles give height above mean sea level. The two differ by the geoid
-  undulation (about -33 m around New York, -28 m in south-west Florida), so every observer
-  sat that far too high relative to the aircraft. The sample trace in `tests/data` shows it
-  independently: its GNSS altitude minus its QNH-corrected pressure altitude is -32.2 m
-  (median of 1,025 reports) where EGM96 gives -33.6 m. Observers are now placed at terrain
-  height plus the EGM96 undulation (NGA, public domain, 2.7 MB, downloaded once from PROJ's
-  data repository), and baro-only aircraft get the same shift unless `--calibrate-baro`
-  maps them onto the GNSS datum directly. At Oyster Bay this moves the observer 32 m down,
-  which changes the King Air's 3.6 km slant range by about 9 m.
-
-- **`explain`.** The video's step-by-step panel for any flight, observer and reception time,
-  including what the reception-time model would say. On the video's own numbers it gives
-  t_e = 16.910 s, r = 2775 m, v_r = 121.16 m/s and f = 96.07 Hz.
-- **Filter funnel** (`search --funnel`): points, (point, flight, flight) triples and flight
-  pairs after the offset filter alone, after speed and distance, and after silence, the
-  counts the video quotes. The offset-only stage is the expensive one, so it is opt-in.
-- **Recording clock.** Every search and refine row now has `rec_start_unix`, the UTC time of
-  the recording's first sample that the candidate implies.
-- **Turn-aware trajectories** (`--interp hermite`). ADS-B reports arrive every 1-20 s; joined
-  with straight lines, a turning aircraft's velocity is constant between reports and jumps at
-  each one, so the modelled range rate is a staircase. Each readsb report also carries ground
-  speed and true track; using them as the velocity at each report (cubic Hermite in lat/lon,
-  monotone cubic in altitude) makes the path curve the way the aircraft did. On a 1.5 deg/s
-  turn at 60 m/s, with exact speed and track in each report:
-
-  | report interval | linear: position, curve error | hermite: position, curve error |
-  |---|---|---|
-  | 4 s | 3.1 m, 0.48 Hz | 0.06 m, 0.01 Hz |
-  | 8 s | 12.6 m, 1.4 Hz | 0.12 m, 0.02 Hz |
-  | 15 s | 44 m, 3.1 Hz | 0.27 m, 0.03 Hz |
-
-  (100 Hz tone, observer 4 km off the turn.) A 1.4 Hz error is as wide as the ridge score's
-  whole 1.5 % tolerance, so this is the change most likely to matter on turning passes such
-  as the faint N7681Y curve above. Real reports carry quantised and noisy speed and track,
-  so the gain on real data is smaller: on the sample trace, predicting every other report
-  from the rest, the median horizontal error falls from 6.7 m to 4.7 m (in turns faster
-  than 0.5 deg/s, 7.4 to 4.4 m).
-
-  ("Hermite" is the name of the interpolation: a cubic between two points that matches both
-  the positions *and* the velocities given at them. Linear interpolation matches only the
-  positions, so the path has a corner, and the velocity a jump, at every report.)
-- **Baro datum** (`--calibrate-baro`). Geometric altitude is GNSS height; barometric altitude
-  assumes a standard atmosphere and is off by tens of metres on any non-standard day (76 m on
-  the test trace, QNH 1026 hPa). Aircraft that report both measure the offset; it is fitted per
-  half hour as a + b x baro and applied to aircraft that only report baro. On the sample
-  trace, hiding one 10-minute block of GNSS altitude at a time: raw pressure altitude is 76 m
-  off, calibrated 0.8 m (median; 12 m at the 90th percentile). That calibrates the aircraft
-  from its own other blocks, which flatters it; `tests/test_real_day.py` does it across
-  aircraft.
-- **Weather** (`--temp`, `--lapse`, `--wind SPEED FROM_DEG`, `--weather`). The speed of sound
-  follows temperature (0.6 m/s per degree C) and, since temperature falls with height, differs
-  from ray to ray: each ray uses the mean over the heights it crosses (see Real-data results
-  below for why). A uniform wind is modelled exactly: the sound heard at t_e + tau left when
-  |D + w tau| = c tau (D from observer to aircraft), and the heard frequency is
-  f0 / (1 + d tau / d t_e). The obvious shortcut (a direction-dependent sound speed c + w.k
-  with the ray straight) is off by about as much as ignoring the wind, because the ray tilts
-  by about |w|/c and that tilt multiplies the aircraft's speed; the test checks the model
-  against an exact air-frame ray solution. `--weather` reads the hour's temperature profile
-  and the mean wind below 3 km from Open-Meteo's historical forecast archive (pressure levels).
-- **Traced-line scoring** (`--score line`, `trace-line`). The video scores its faint curve by
-  distance from a line drawn on the spectrogram. `trace-line` stores a line in the event JSON,
-  from a hand-traced CSV (any tool that exports t, f points) or from the automatic ridge's
-  reliable frames, which a person can then trim; `--score line` scores against it with the
-  ridge score's kernel.
-- **Exports and figures.** `export` writes the best point of each flight pair as GeoJSON, KML
-  or a standalone Leaflet map, each with Google Maps and Street View links, the video's
-  final check. `plot` draws an event fit, the score map, the best score per flight pair, and
-  a candidate's modelled curves over both event windows.
-- **Peak spread.** `refine` prints how many fine points score within 1 % and 5 % of the peak
-  and how far the farthest is: a direct read of how well the events pin the point (tight for
-  a low lateral pass, wide for two overhead ones, as on the eagle cam).
-- **Several trace files** (`--traces day1.npz day2.npz`), for a recording whose UTC day is
-  uncertain or that spans midnight UTC.
-
-### Countermeasures
-
-The video's last part, checked on a synthetic recording (`tests/test_countermeasures.py`):
-
-- A 4th-order high-pass at 200 Hz, above both tones, followed by a 20 dB boost: the fit lands
-  on the same curve. A linear filter scales tone and noise in a frequency bin alike, and the
-  per-bin whitening undoes the scale.
-- A 300-3400 Hz phone band removes a 120 Hz fundamental entirely; its fourth harmonic, at
-  480 Hz, traces the same Doppler factor and fits to the right speed and CPA time.
-
-`audit` reports whether a recording leaks: it runs `detect` and compares each flyover with
-the best score the detector finds in the *time-reversed* spectrogram. A Doppler curve only
-ever falls, so reversed it is a rising curve the model cannot fit, while noise, bursts, hum
-and speech look the same either way; the reversed best is the level chance reaches in that
-recording. Two flyovers above it is "high" (enough for a blind two-event search), one is
-"medium" (enough with a known time). `detect --null` prints the same chance level.
-
-`scrub` removes the leak from the audio of a given list of events (`audit --out` writes
-one). In the default `fill` mode the short-time spectrum along every harmonic of each curve,
-up to 1.5 kHz, is replaced by that bin's own noise floor with random phase. Zeroing the bins
-instead would leave a dark curve of the same shape, which leaks just as much. `mute` silences
-each event window and `cut` deletes it, which also destroys the time between events the
-two-event search depends on. Only the events passed in are removed, and a detected fit
-can be far enough off the real tone that the mask misses it (on the synthetic recording
-`detect` fitted one flyover at 103 Hz and 44 m/s, where the tone was 120 Hz at 110 m/s), so
-`scrub --band FLO FHI` audits its own output, which fits the remaining tones afresh, and
-scrubs whatever is still above chance, up to `--passes` more times. On that recording
-the risk went from high to medium after the first pass and to low after the second.
-
-## Validation
-
-| tests | data | runs |
-|---|---|---|
-| `test_physics`, `test_video_methods`, `test_countermeasures`, `test_pipeline_synthetic`, ... | synthetic, generated in the test | always |
-| `test_real_adsb` | the real readsb trace and an EGM96 crop in `tests/data` | always (offline) |
-| `test_real_day` | one real day of ADS-B over a region | `DOPPLERTRACK_DAY_TRACES=traces.npz` |
-| `test_oyster_bay`, `test_real_recordings` | the two recordings with known answers, and their days of ADS-B | `DOPPLERTRACK_OYSTER_BAY=dir`, `DOPPLERTRACK_SWFL=dir` |
-
-`test_real_recordings` searches around each known answer under six option sets (the old
-baseline, the geoid, Hermite, Hermite with baro calibration, and the temperature profile with
-and without wind, from the saved weather in `tests/data`) and asserts the right flight pair
-stays first and within 500 m (Oyster Bay) or 2.5 km (the eagle cam, two overhead passes); with `DOPPLERTRACK_REPORT=report.csv` it writes
-the peak distance, score and margin for each, which is the evidence for changing a default.
-Preparing the data (needs ffmpeg and yt-dlp; each day of ADS-B streams ~4 GB):
-
-```bash
-mkdir -p data/oyster_bay data/swfl
-yt-dlp -f bestaudio -o data/oyster_bay/rec.%(ext)s https://youtu.be/4CxVxuMVkMc
-uv run dopplertrack spectrogram data/oyster_bay/rec.* data/oyster_bay/rec.npz
-uv run dopplertrack fetch-day 2026-09-08 data/oyster_bay/traces_ny.npz --bbox 40.4 41.3 -74.4 -72.6
-yt-dlp -f bestaudio -o data/swfl/rec.%(ext)s https://youtu.be/zs2o5Rhlp5w
-uv run dopplertrack spectrogram data/swfl/rec.* data/swfl/rec.npz
-uv run dopplertrack fetch-day 2024-12-28 data/swfl/traces_swfl.npz --bbox 26.115 27.285 -82.505 -81.195
-DOPPLERTRACK_OYSTER_BAY=data/oyster_bay DOPPLERTRACK_SWFL=data/swfl \
-  DOPPLERTRACK_DAY_TRACES=data/oyster_bay/traces_ny.npz DOPPLERTRACK_REPORT=report.csv \
-  uv run pytest -s tests/test_real_recordings.py tests/test_real_day.py tests/test_oyster_bay.py
-```
-
-### Real-data results (2026-11-05)
-
-Both recordings and their days of ADS-B were supplied by the repository owner (Oyster Bay:
-1,016 non-jet flights; eagle cam: 556). Flight-data checks, the aircraft against their own
-reports:
-
-| check | Oyster Bay day | eagle-cam day |
-|---|---|---|
-| Hermite vs linear, every other report held out (median / 90th percentile) | 5.9 / 15.0 -> 4.2 / 11.1 m (730,342 reports) | 8.4 / 21.9 -> 5.9 / 16.3 m (183,883) |
-| Baro calibration across aircraft, GNSS altitude hidden (median error) | 68.6 -> 11.4 m (174 aircraft) | 68.6 -> 2.7 m (96) |
-| Airborne reports carrying GNSS altitude | 99 % | 99 % |
-
-**The speed of sound is per ray.** Scored with one sound speed for both flyovers, the
-Oyster Bay PC-12 (5.5 km above the observer) fits best at 337 m/s and the King Air (1.1 km)
-at 342 m/s. That afternoon's temperature profile (Open-Meteo pressure levels: 26 C at the
-ground, 13 C at 1.6 km) gives column means of 336 and 344 m/s. So `c` can now be a
-`doppler.Atmosphere`: each ray travels at the mean sound speed of the air it crosses, and
-`--weather` fetches the hour's profile (and the mean wind below 3 km); `--lapse` builds a
-standard-lapse column from `--temp`.
-
-Location, searching around each known answer with the committed event fits (Oyster Bay 10 m
-grid, eagle cam 50 m; "score" is the true pair's best score):
-
-| configuration | Oyster Bay: peak, score | eagle cam: peak, score |
-|---|---|---|
-| baseline: 15 C, old datum, linear | 66 m, 29.09 | 1,284 m, 10.21 |
-| geoid + Hermite, 15 C | 80 m, 28.41 | 1,674 m, 10.02 |
-| geoid + Hermite, the afternoon's surface temperature for every ray | 166 m, 24.39 | 1,303 m, 9.30 |
-| geoid + Hermite + profile | 105 m, 28.70 | 1,613 m, 10.24 |
-| geoid + Hermite + profile + wind | 89 m, 29.02 | 1,613 m, 10.17 |
-| old datum + linear + profile | 118 m, 28.29 | 1,739 m, 10.27 |
-
-What the two recordings say:
-
-- **None of the options moves the answer by a meaningful amount.** Every configuration finds
-  the right flight pair; Oyster Bay stays within 66-166 m, and the eagle cam stays at the
-  1.3-1.7 km its two overhead passes allow (the README's earlier 592 m used three more
-  flyovers).
-- **The obvious use of weather is harmful.** The afternoon's surface temperature (26 C) as the
-  sound speed of every ray cuts the Oyster Bay score by 16 % and moves its peak to 166 m.
-  The old 15 C default works only because 340 m/s happens to sit between the two rays' true
-  means. The profile recovers the fit (28.70-29.02) for physical reasons rather than by luck.
-- **Errors were cancelling.** With a constant 15 C, the geoid fix scores slightly worse on both
-  recordings; with the profile, it scores better at Oyster Bay (28.70 vs 28.29, peak 105 vs
-  118 m). The old datum was partly compensating for the wrong sound speed.
-
-Defaults are therefore unchanged except the geoid: `--interp hermite`, `--calibrate-baro`,
-`--weather` and `--lapse` are measurably right about the flight data and the atmosphere but
-have not improved a location on these two recordings, so they stay opt-in. Two recordings
-with known answers are too few to settle more than that; lateral, low passes (which constrain
-the location) are what the next validation recordings need.
-
-### Livermore: 40 single flyovers (`benchmarks/livermore.py`)
-
-A public dataset (Pathak 2026, [Zenodo 23424278](https://zenodo.org/records/23424278),
-CC BY 4.0): 40 smartphone recordings of aircraft over Livermore, CA, May 2026, each with the
-author's traced frequency curve (UTC timestamps), the ADS-B track, and the true horizontal,
-vertical and slant distance from the recorder to the track. The recorder's position is not
-published and it moved between sessions, so each configuration locates the recorder from one
-traced curve (free clock shift and rest frequency) and is scored by the slant distance it
-recovers. The measurement is the author's, so this tests the propagation model alone.
-
-| configuration | median slant error | mean | better than old (of 40) | paired p |
-|---|---|---|---|---|
-| old: 15 C, linear, old datum | 84 m | 136 m | n/a | n/a |
-| geoid | 83 m | 132 m | 18 | 0.61 |
-| geoid + Hermite | 81 m | 136 m | 21 | 0.25 |
-| + the afternoon's surface temperature | 69 m | 122 m | 24 | 0.44 |
-| + temperature profile | 56 m | 134 m | 22 | 0.37 |
-| + profile + wind | 63 m | 138 m | 22 | 0.43 |
-
-The profile lowers the median by a third, but no configuration is distinguishable from the
-old model (Wilcoxon signed-rank, every p > 0.2). The traced curves sit about 3.3 Hz (1 %) from
-every model's best fit, far above the fractions of a hertz the changes make, so on this data
-the measurement noise decides; the aircraft here are also low (median 1.3 km), where the
-profile differs little from the surface. Real-data evidence so far, over 42 flyovers on three
-sites: the changes fix the physics they target and do not yet show in a location.
-
-## Changes from the method in the video
+## Differences from the method in the video
 
 The physics and the search strategy are the author's. What differs:
 
-- **Automatic curve measurement.** The video measures each Doppler curve by
-  hand, sliding f0 / speed / distance / CPA-time until the overlay looks
-  right, then choosing "generous ranges" by eye. `fit` does this without a
-  person: the window is whitened per frequency bin so stationary tones
-  (mains hum, machinery) vanish, a vectorised grid search over all four
-  parameters maximises spectrogram brightness under the curve, and a
-  Nelder-Mead pass refines it. The ideal-curve fit still only seeds coarse
-  filters; final ranking uses real trajectories.
-- **Harmonic-aware fitting and scoring.** When a flyover shows a second
-  harmonic, fundamental and harmonic are scored together, which constrains
-  the curve more tightly than one line.
-- **Open, documented data path.** The video used a paid/scraped ADS-B feed
-  and did not release code. Here every input is a public dataset with a
-  loader: adsb.lol daily archives, ICAO Doc 8643 engine classes, AWS
-  terrain tiles.
-- **Search engineering.** A KD-tree corridor around each flight path limits
-  CPA computation to grid points that could possibly hear it; distance math
-  is chunked so multi-hour tracks do not exhaust memory; the time-shift and
-  f0 sweeps of the locked scorer run as one array operation per candidate.
-- **Single-event, known-time mode as a first-class command.** The video
-  demonstrates locating from one faint one-minute curve when the recording
-  time is known; `search-single` exposes that directly, and reproduces it on
-  the Oyster Bay hour (see above).
-- **Ridge scoring as an option.** The video scores its faint curve by
-  distance from a hand-traced line; `--score ridge` traces the line itself,
-  with a uniqueness mask instead of a person's judgement of where the line
-  is real.
+- **Automatic curve measurement.** The video slides f0, speed, distance and
+  CPA time by hand until the overlay looks right. `fit` and `detect` do it
+  with a grid search plus Nelder-Mead on the whitened window.
+- **Pairs of flights, not points along one flight.** The video lays points
+  along every flight matching event 1 at the fitted distance and tests them
+  for event 2, which needs tight hand-fitted ranges. Joining flight pairs on
+  the geometry of both events first stays cheap under the wide gates an
+  automatic fit needs; with tight gates it reduces to the video's method.
+- **Harmonic-aware fitting and scoring**, where a flyover shows a second
+  harmonic.
+- **Open data path.** adsb.lol daily archives, ICAO Doc 8643 engine classes
+  and AWS terrain tiles, each with a loader; nothing scraped or paid.
+- **One command for every search.** A box, a known point, or one flyover
+  with a known time are options on the same search, not separate methods.
 
-Kept unchanged on purpose: emission-time radial velocity (not
-observation-time), propagation-delayed CPA times, slant distance with a DEM,
-the inter-event offset filter, the silence filter, and locked two-event
-scoring where event 1 absorbs measurement error and event 2 is placed purely
-by flight geometry.
+Kept on purpose: emission-time radial velocity, propagation-delayed CPA
+times, slant distance with a DEM, the inter-event offset filter, the silence
+filter, and locked two-event scoring.
 
 ## Data sources (all free)
+
+Also used by the additions in docs/video-method.md: NGA's EGM96 geoid (public domain, via
+PROJ-data on GitHub), Open-Meteo's historical forecast archive for temperature and wind
+profiles (CC BY 4.0), and the Livermore flyover dataset (Pathak 2026, Zenodo 23424278,
+CC BY 4.0) for `benchmarks/livermore.py`.
+
 
 | Need | Source |
 |---|---|
 | Historical ADS-B | adsb.lol `globe_history_YYYY` GitHub releases (~4 GB/day) |
 | Aircraft engine class | OpenSky mirror of ICAO Doc 8643 |
 | Elevation | AWS Terrain Tiles (Terrarium) |
-| Weather (optional) | Open-Meteo ERA5 archive |
-| Geoid (sea level above the ellipsoid) | NGA EGM96 15', via PROJ-data on GitHub |
-| Temperature and wind profile (optional) | Open-Meteo historical forecast API (CC BY 4.0) |
 
 ## Development
 
@@ -568,22 +197,21 @@ by flight geometry.
 uv run pytest
 ```
 
+The suite runs on synthetic flights in about three minutes. The Oyster Bay
+check against the real recording is opt-in: set `DOPPLERTRACK_OYSTER_BAY`
+to a directory holding `rec.npz` and `traces_ny.npz` (see
+`tests/test_oyster_bay.py`). The original design notes are in
+`docs/superpowers/specs/`; [CHANGELOG.md](CHANGELOG.md) lists the changes
+per release.
+
 ## Releasing
 
-Releases are driven by git tags. Pushing a tag `vX.Y.Z` that matches the
-version in `pyproject.toml` runs `.github/workflows/release.yml`, which runs
-the tests, builds the sdist and wheel, attaches them to a GitHub Release with
-generated notes, and publishes to PyPI through trusted publishing (no API
-token stored anywhere).
+Pushing a tag `vX.Y.Z` that matches the version in `pyproject.toml` runs
+`.github/workflows/release.yml`: tests, sdist and wheel, a GitHub Release
+with generated notes, and PyPI through trusted publishing.
 
 ```bash
-uv version 0.2.0            # bump pyproject.toml
-git commit -am "Release 0.2.0"
-git tag v0.2.0 && git push && git push --tags
+uv version 0.3.0            # bump pyproject.toml
+git commit -am "Release 0.3.0"
+git tag v0.3.0 && git push && git push --tags
 ```
-
-One-time setup for PyPI: on pypi.org, add a *pending publisher* for project
-`dopplertrack` with owner `mjshiggins`, repository `dopplertrack`, workflow
-`release.yml`, environment `pypi`, and create a `pypi` environment in the
-GitHub repository settings. Until that exists the `pypi` job fails and the
-GitHub Release still succeeds.

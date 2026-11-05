@@ -57,16 +57,17 @@ def test_a_high_pass_is_heard_through_colder_air():
     assert err(column) < 0.25 * err(surface)
 
 
-def test_cpa_table_and_curve_use_the_same_delay():
-    from dopplertrack.search import Grid, Segment, cpa_table
+def test_search_cpa_and_curve_use_the_same_delay():
+    from dopplertrack.search import cpa_to_points
     te, pos = _pass(3000.0)
-    seg = Segment(0, "x", te + 1e9, pos, np.full(len(te), 130.0))
-    g = Grid.points([40.0], [-73.0], [0.0])
+    obs = np.array([[0.0, 0.0, 20.0]])
     atm = Atmosphere.standard(25.0)
-    row = cpa_table(g, [seg], max_range_m=10000, c=atm).iloc[0]
-    tcpa, theard, _, _ = doppler.cpa_from_trajectory(seg.t, seg.enu, g.enu[0], c=atm)
-    assert row.t_heard == pytest.approx(theard, abs=1e-6)
-    assert theard - tcpa == pytest.approx(np.linalg.norm(pos[400] - g.enu[0]) / float(atm.mean_speed(g.enu[0][2], 3000.0)), rel=1e-3)
+    d, th, _, _ = cpa_to_points(obs, pos, te + 1e9, np.full(len(te), 130.0), atm)
+    tcpa, theard, _, _ = doppler.cpa_from_trajectory(te + 1e9, pos, obs[0], c=atm)
+    assert th[0] == pytest.approx(theard, abs=1e-6)
+    assert theard - tcpa == pytest.approx(d[0] / float(atm.mean_speed(20.0, 3000.0)), rel=1e-3)
+    th_w = cpa_to_points(obs, pos, te + 1e9, np.full(len(te), 130.0), atm, wind=(0.0, -10.0))[1]
+    assert th_w[0] < th[0]                       # the pass is to the north; a wind towards the south speeds the sound up
 
 
 @pytest.mark.parametrize("name,t,surface", [("oyster_bay", 1788900805, 26.0), ("swfl", 1735415920, 26.3)])

@@ -28,9 +28,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from dopplertrack import adsb, pipeline
+from dopplertrack import adsb
 from dopplertrack.geo import haversine_m
-from dopplertrack.search import Grid
+from dopplertrack.search import DayIndex, Grid, run_search
 from dopplertrack.tracks import EventFit
 
 RESULTS = Path(__file__).parent.parent / "docs" / "results"
@@ -104,11 +104,11 @@ def test_options_keep_the_answer(rec, opt, loaded):
     h, step = cfg["half_m"], cfg["step_m"]
     m_lat, m_lon = 111320.0, 111320.0 * np.cos(np.radians(lat))
     c_lat, c_lon = lat + 17 / m_lat, lon + 23 / m_lon
-    grid = Grid.make(c_lat - h / m_lat, c_lat + h / m_lat, c_lon - h / m_lon, c_lon + h / m_lon, step,
-                     Terrain().elevation, geoid)
+    grid = Grid.make(c_lat - h / m_lat, c_lat + h / m_lat, c_lon - h / m_lon, c_lon + h / m_lon, step, Terrain().elevation)
+    idx = DayIndex.build(traces, lat, lon, interp=o["interp"])
     ev1, ev2 = cfg["events"]()
-    res, _ = pipeline.run_search(sp, ev1, ev2, traces, grid, harmonics=cfg["harmonics"], interp=o["interp"], progress=False,
-                                 c=c, wind=wind)
+    res = run_search(sp, ev1, ev2, idx, harmonics=cfg["harmonics"], points=(grid.lat, grid.lon, grid.elev), c=c, wind=wind,
+                     geoid=geoid, workers=1, log=lambda m: None)
     assert len(res), "no candidate survived the filters"
     best = res.drop_duplicates(["icao1", "icao2"]).reset_index(drop=True)
     top = best.iloc[0]

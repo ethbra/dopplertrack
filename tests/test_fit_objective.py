@@ -4,7 +4,7 @@ edges and at most about half the level at them, so the two cannot be confused.""
 import numpy as np
 import pytest
 
-from dopplertrack import cli, pipeline
+from dopplertrack import cli, tracks
 from dopplertrack.audio import Spectrogram
 from dopplertrack.tracks import EventFit, fit_event, grid_search
 
@@ -40,7 +40,7 @@ def test_fit_cli_defaults_to_brightness(tmp_path, monkeypatch):
         seen.append(objective)
         return EventFit(t_cpa=0, t_cpa_emit=0, f0=1, v=1, d=1, t_start=t0, t_end=t1, score=0, f_pre=1, f_post=1)
 
-    monkeypatch.setattr(pipeline, "fit_event", fake_fit_event)
+    monkeypatch.setattr(tracks, "fit_event", fake_fit_event)
     cli.main(["fit", str(spec), "--window", "100", "140", "--band", "100", "150"])
     cli.main(["fit", str(spec), "--window", "100", "140", "--band", "100", "150", "--objective", "contrast"])
     assert seen == ["brightness", "contrast"]

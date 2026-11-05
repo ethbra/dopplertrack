@@ -228,9 +228,10 @@ def save_traces(traces: list[Trace], path: str | Path):
 
 def load_traces(path: str | Path) -> list[Trace]:
     z = np.load(path, allow_pickle=False)
+    meta = z["meta"]                      # read once: indexing z[...] decompresses the member each time
     out = []
     for i in range(int(z["n"])):
-        icao, reg, typ, desc = json.loads(str(z["meta"][i]))
+        icao, reg, typ, desc = json.loads(str(meta[i]))
         a = z[f"a{i}"]
         extra = (a[6], a[7], a[8] > 0, a[9]) if a.shape[0] >= 10 else ()
         out.append(Trace(icao, reg, typ, desc, a[0], a[1], a[2], a[3], a[4], a[5].astype(bool), *extra))

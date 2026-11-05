@@ -30,7 +30,10 @@ class Terrain:
             try:
                 r = requests.get(_URL.format(z=self.z, x=x, y=y), timeout=60)
                 r.raise_for_status()
-                p.write_bytes(r.content)
+                # write-then-rename so a concurrent reader (another worker process) never sees a partial file
+                tmp = p.with_name(f"{p.name}.{os.getpid()}.part")
+                tmp.write_bytes(r.content)
+                os.replace(tmp, p)
                 return
             except requests.RequestException:
                 if attempt == 3:
@@ -47,7 +50,12 @@ class Terrain:
         if k in self._mem:
             return self._mem[k]
         self._download(x, y)
-        img = np.asarray(Image.open(self._path(x, y)).convert("RGB"), dtype=np.float64)
+        try:
+            img = np.asarray(Image.open(self._path(x, y)).convert("RGB"), dtype=np.float64)
+        except (OSError, Image.UnidentifiedImageError):      # a damaged cached tile: fetch it again once
+            self._path(x, y).unlink(missing_ok=True)
+            self._download(x, y)
+            img = np.asarray(Image.open(self._path(x, y)).convert("RGB"), dtype=np.float64)
         elev = img[..., 0] * 256 + img[..., 1] + img[..., 2] / 256 - 32768
         self._mem[k] = elev
         return elev

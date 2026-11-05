@@ -1,20 +1,33 @@
-"""dopplertrack command line."""
+"""dopplertrack command line: spectrogram, detect, fit, fetch, search, refine, and the tools
+around them: explain, trace-line, audit, scrub, export, plot."""
 from __future__ import annotations
 
 import argparse
 import json
-import sys
+import os
+import time
+
+# One BLAS thread per process: the heavy stages run a process per core, and the matrices
+# are small, so BLAS threads on top of that only contend. Set before numpy loads.
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_v, "1")
 
 import numpy as np
 
 from . import pipeline
-from .adsb import INTERP_METHODS, calibrate_baro, load_many
+from .adsb import INTERP_METHODS
 from .audio import Spectrogram
 from .doppler import speed_of_sound
 from .score import SCORE_MODES
-from .search import Grid
+from .search import DayIndex, rescore_with_extra, run_search
 from .terrain import Terrain
+from .verdict import verdict
 from .tracks import EventFit
+
+BBOX = dict(nargs=4, type=float, metavar=("LATMIN", "LATMAX", "LONMIN", "LONMAX"))
+SCORE = dict(choices=SCORE_MODES, default="brightness",
+             help="brightness: brightness under the modelled curve; ridge: how closely it follows the ridge traced in the window "
+                  "(for faint curves); line: how closely it follows the line stored in each event by trace-line")
 
 
 def load_event(path) -> EventFit:
@@ -48,6 +61,8 @@ def parse_utc(s: str) -> float:
         return dt.timestamp()
 
 
+
+
 def _add_medium(sp, weather=True):
     sp.add_argument("--temp", type=float, metavar="C", help="air temperature for the speed of sound (default 15 C, 340.3 m/s)")
     sp.add_argument("--wind", nargs=2, type=float, metavar=("SPEED", "FROM_DEG"),
@@ -60,13 +75,6 @@ def _add_medium(sp, weather=True):
                              "sound speed of the air it crosses; --temp/--wind override")
 
 
-def _add_traces(sp):
-    sp.add_argument("--traces", required=True, nargs="+", help="one or more trace files (e.g. consecutive UTC days)")
-    sp.add_argument("--interp", choices=INTERP_METHODS, default="linear",
-                    help="trajectory between ADS-B reports: linear (as the results were made) or hermite (uses each report's speed and track, so turns curve)")
-    sp.add_argument("--calibrate-baro", action="store_true",
-                    help="move baro-only altitudes onto the geometric datum using aircraft that report both")
-    _add_geoid(sp)
 
 
 def _add_geoid(sp):
@@ -85,18 +93,6 @@ def _geoid(a):
     except Exception as e:
         raise SystemExit(f"could not load the EGM96 geoid grid ({e}); pass --no-geoid to run without it")
 
-
-def _traces(a, geoid=None):
-    traces = load_many(a.traces)
-    if getattr(a, "calibrate_baro", False):
-        st = calibrate_baro(traces)
-        pipeline.log(f"baro calibration: {st}")
-    elif geoid is not None:
-        from .adsb import baro_to_ellipsoid
-        n = baro_to_ellipsoid(traces, geoid)
-        if n:
-            pipeline.log(f"{n} baro-only reports moved to the ellipsoid by the geoid (try --calibrate-baro)")
-    return traces
 
 
 def _medium(a, lat=None, lon=None, unix_t=None):
@@ -121,17 +117,27 @@ def _medium(a, lat=None, lon=None, unix_t=None):
     return c, wind
 
 
-def _median_time(traces):
-    return float(np.median(np.concatenate([t.t for t in traces]))) if traces else None
+
+def _c(a):
+    """The scalar sound speed for commands that fit ideal curves (fit, detect, audit, scrub)."""
+    return speed_of_sound(15.0 if getattr(a, "temp", None) is None else a.temp)
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="dopplertrack")
+    ap = argparse.ArgumentParser(prog="dopplertrack", description="Locate a recording from the Doppler curves of aircraft it caught, matched against historical ADS-B.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("spectrogram", help="audio/video file -> whitened low-band spectrogram (.npz)")
     s.add_argument("audio"); s.add_argument("out"); s.add_argument("--hop", type=float, default=0.25)
     s.add_argument("--fmin", type=float, default=40); s.add_argument("--fmax", type=float, default=450)
+
+    d = sub.add_parser("detect", help="scan a whole spectrogram for Doppler events and rank them")
+    d.add_argument("spec"); d.add_argument("--band", nargs=2, type=float, required=True, metavar=("FLO", "FHI"))
+    d.add_argument("--harmonics", type=int, default=1); d.add_argument("--top", type=int, default=20)
+    d.add_argument("--window", type=float, default=240.0); d.add_argument("--out", help="write ranked fits as a JSON list")
+    d.add_argument("--max-burst", type=float, help="drop events whose surroundings are mostly broadband burst (a passing train or truck sweeps like an aircraft); e.g. 0.15")
+    d.add_argument("--temp", type=float, metavar="C", help="air temperature for the speed of sound (default 15 C)")
+    d.add_argument("--null", action="store_true", help="also scan the time-reversed spectrogram and mark events above that chance level")
 
     f = sub.add_parser("fit", help="fit an ideal Doppler curve inside a time/frequency window")
     f.add_argument("spec"); f.add_argument("--window", nargs=2, type=float, required=True, metavar=("T0", "T1"))
@@ -141,67 +147,57 @@ def main(argv=None):
                    help="brightness: mean brightness under the curve (the docs/results fits); contrast: the sweep-weighted ridge contrast detect uses")
     f.add_argument("--temp", type=float, metavar="C", help="air temperature for the speed of sound (default 15 C)")
 
-    d = sub.add_parser("detect", help="scan a whole spectrogram for Doppler events and rank them")
-    d.add_argument("spec"); d.add_argument("--band", nargs=2, type=float, required=True, metavar=("FLO", "FHI"))
-    d.add_argument("--harmonics", type=int, default=1); d.add_argument("--top", type=int, default=20)
-    d.add_argument("--window", type=float, default=240.0); d.add_argument("--out", help="write ranked fits as a JSON list")
-    d.add_argument("--temp", type=float, metavar="C", help="air temperature for the speed of sound (default 15 C)")
-    d.add_argument("--null", action="store_true", help="also scan the time-reversed spectrogram and mark events above that chance level")
+    fe = sub.add_parser("fetch", help="one UTC day of adsb.lol history -> the day index a search runs on (streamed from GitHub, no disk needed)")
+    fe.add_argument("date", help="YYYY-MM-DD (UTC day)"); fe.add_argument("out", help="day index .npz")
+    fe.add_argument("--bbox", **BBOX, help="keep only flights touching this box (default: the whole day, everywhere)")
+    fe.add_argument("--archive", metavar="DIR", help="read an already extracted day archive instead of streaming")
+    fe.add_argument("--keep-jets", action="store_true"); fe.add_argument("--pod", default="planes-readsb-prod-0")
+    fe.add_argument("--origin", nargs=2, type=float, metavar=("LAT0", "LON0"), help="frame origin (default: the flights' mean position)")
+    fe.add_argument("--traces", metavar="NPZ", help="also save the raw traces here")
+    fe.add_argument("--from-traces", nargs="+", metavar="NPZ", help="index trace files saved earlier (by --traces or an older fetch-day) instead of streaming")
+    fe.add_argument("--interp", choices=INTERP_METHODS, default="linear",
+                    help="paths between ADS-B reports: linear, or hermite (uses each report's speed and track, so turns curve)")
+    fe.add_argument("--calibrate-baro", action="store_true",
+                    help="move baro-only altitudes onto the GNSS datum with an offset fitted from the aircraft that report both")
+    _add_geoid(fe)
 
-    e = sub.add_parser("extract-region", help="pull traces touching a bbox out of an adsb.lol day archive")
-    e.add_argument("archive_dir"); e.add_argument("out")
-    e.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("LATMIN", "LATMAX", "LONMIN", "LONMAX"))
-    e.add_argument("--keep-jets", action="store_true")
-
-    fd = sub.add_parser("fetch-day", help="stream one UTC day of adsb.lol history from GitHub, keeping traces in a bbox (no disk needed)")
-    fd.add_argument("date", help="YYYY-MM-DD (UTC day)"); fd.add_argument("out")
-    fd.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("LATMIN", "LATMAX", "LONMIN", "LONMAX"))
-    fd.add_argument("--keep-jets", action="store_true"); fd.add_argument("--pod", default="planes-readsb-prod-0")
-
-    r = sub.add_parser("search", help="rank candidate locations for a two-event recording")
-    r.add_argument("spec"); r.add_argument("--events", nargs=2, required=True, metavar=("EV1_JSON", "EV2_JSON"))
-    _add_traces(r); r.add_argument("--out", required=True)
-    r.add_argument("--bbox", nargs=4, type=float, metavar=("LATMIN", "LATMAX", "LONMIN", "LONMAX"))
-    r.add_argument("--point", nargs=2, type=float, metavar=("LAT", "LON"), help="score a single known point instead of a grid")
-    r.add_argument("--spacing", type=float, default=200.0); r.add_argument("--harmonics", nargs=2, type=int, default=(1, 1))
-    r.add_argument("--no-dem", action="store_true"); r.add_argument("--no-silence", action="store_true")
-    r.add_argument("--tol", type=float, default=6.0)
+    r = sub.add_parser("search", help="rank candidate locations over a day index: pair join, lens lattices, locked scoring")
+    r.add_argument("spec"); r.add_argument("--events", nargs="+", required=True, metavar="EV_JSON", help="two events, or one with --utc")
+    r.add_argument("--day", required=True, help="day index .npz from fetch"); r.add_argument("--out", required=True)
+    r.add_argument("--utc", help="one event only: its heard CPA time, unix seconds or ISO-8601 UTC")
+    r.add_argument("--bbox", **BBOX, help="only flights in this box (default: the whole index)")
+    r.add_argument("--point", nargs=2, type=float, metavar=("LAT", "LON"), help="score this one known point instead of searching")
+    r.add_argument("--cands", metavar="NPZ", help="cache the candidate table here; reused when the index, gates and geometry match")
+    r.add_argument("--harmonics", nargs="+", type=int, default=[1, 1], help="harmonics per event")
+    r.add_argument("--tol", type=float, help="heard-gap tolerance, s (default 6; 30 with --utc)")
     r.add_argument("--v-tol", type=float, default=0.35, help="speed gate, as a fraction of each event's fitted speed")
     r.add_argument("--d-tol", nargs=2, type=float, default=(0.4, 2.5), metavar=("LO", "HI"), help="distance gate, as multiples of each event's fitted CPA distance")
-    r.add_argument("--cpa-cache", metavar="NPZ", help="cache the (point, flight) CPA table here; reused on reruns with the same grid and traces")
-    r.add_argument("--score", choices=SCORE_MODES, default="brightness",
-                   help="brightness: brightness under the modelled curve; ridge: how closely it follows the ridge traced in the window (for faint curves); line: how closely it follows the line stored in each event by trace-line")
-    r.add_argument("--funnel", action="store_true", help="also count the offset-only stage of the filter funnel (as the video reports it); slower on big grids")
-    _add_medium(r)
+    r.add_argument("--max-range", type=float, default=12000.0); r.add_argument("--spacing", type=float, default=200.0)
+    r.add_argument("--coarse", type=float, default=1000.0, help="coarse sweep spacing, m")
+    r.add_argument("--no-silence", action="store_true"); r.add_argument("--no-dem", action="store_true")
+    r.add_argument("--dem-zoom", type=int, default=9, help="terrain tile zoom (9: ~300 m pixels, a few hundred tiles for a continent)")
+    r.add_argument("--workers", type=int, help="process pool size (default: all cores on Linux, 1 on macOS)")
+    r.add_argument("--score", **SCORE); r.add_argument("--top", type=int, default=20)
+    r.add_argument("--extra", nargs="*", default=[], metavar="EV_JSON", help="further events (from detect or fit): the top pairs are rescored with them locked to the same clock")
+    r.add_argument("--extra-harmonics", nargs="*", type=int, default=[])
+    r.add_argument("--top-pairs", type=int, default=200, help="how many of the best two-event pairs to rescore with --extra")
+    r.add_argument("--out-extra", metavar="CSV", help="where the rescored top pairs go (default: OUT with _extra before .csv)")
+    _add_medium(r); _add_geoid(r)
 
     rf = sub.add_parser("refine", help="fine grid around one search result, optionally adding more events")
     rf.add_argument("spec"); rf.add_argument("results", help="CSV written by search")
     rf.add_argument("--events", nargs=2, required=True, metavar=("EV1_JSON", "EV2_JSON"))
-    _add_traces(rf); rf.add_argument("--out", required=True)
-    rf.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("LATMIN", "LATMAX", "LONMIN", "LONMAX"), help="the bbox the search used")
+    rf.add_argument("--day", required=True, help="the day index the search used"); rf.add_argument("--out", required=True)
     rf.add_argument("--rank", type=int, default=1, help="which flight pair to refine, by rank in the results (1 = best)")
     rf.add_argument("--spacing", type=float, default=50.0); rf.add_argument("--half", type=float, default=600.0, help="half-width of the fine grid, m")
     rf.add_argument("--harmonics", nargs=2, type=int, default=(1, 1))
     rf.add_argument("--extra", nargs="*", default=[], metavar="EV_JSON", help="further events (from detect or fit) to score locked to the same clock")
     rf.add_argument("--extra-harmonics", nargs="*", type=int, default=[])
-    rf.add_argument("--no-dem", action="store_true")
-    rf.add_argument("--score", choices=SCORE_MODES, default="brightness", help="as for search")
-    _add_medium(rf)
-
-    g = sub.add_parser("search-single", help="rank locations for ONE event whose absolute time is known")
-    g.add_argument("spec"); g.add_argument("--event", required=True); _add_traces(g)
-    g.add_argument("--utc", required=True, help="heard CPA time of the event, unix seconds or ISO-8601 UTC")
-    g.add_argument("--tol", type=float, default=30.0); g.add_argument("--out", required=True)
-    g.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("LATMIN", "LATMAX", "LONMIN", "LONMAX"))
-    g.add_argument("--spacing", type=float, default=200.0); g.add_argument("--harmonics", type=int, default=1)
-    g.add_argument("--score", choices=SCORE_MODES, default="brightness", help="as for search")
-    _add_medium(g)
-    g.add_argument("--v-tol", type=float, default=0.35, help="speed gate, as a fraction of the fitted speed; a faint or turning pass fits badly, so open it (e.g. 1.0)")
-    g.add_argument("--d-tol", nargs=2, type=float, default=(0.4, 2.5), metavar=("LO", "HI"), help="distance gate, as multiples of the fitted CPA distance (e.g. 0.05 20)")
-    g.add_argument("--no-dem", action="store_true")
+    rf.add_argument("--no-dem", action="store_true"); rf.add_argument("--score", **SCORE)
+    _add_medium(rf); _add_geoid(rf)
 
     x = sub.add_parser("explain", help="the video's step-by-step Doppler panel for one flight, observer and reception time")
-    _add_traces(x)
+    x.add_argument("--day", required=True, help="day index .npz from fetch")
     x.add_argument("--icao", required=True); x.add_argument("--point", nargs=2, type=float, required=True, metavar=("LAT", "LON"))
     x.add_argument("--utc", required=True, help="reception time, unix seconds or ISO-8601 UTC")
     x.add_argument("--f0", type=float, default=100.0, help="rest frequency, Hz"); x.add_argument("--elev", type=float, help="observer elevation, m (default: DEM)")
@@ -230,18 +226,16 @@ def main(argv=None):
     sc.add_argument("--passes", type=int, default=2, help="with --band: audit-and-scrub rounds after the first (default 2)")
 
     ex = sub.add_parser("export", help="candidates as GeoJSON, KML or an HTML map, with Street View links")
-    ex.add_argument("results", help="CSV from search, refine or search-single"); ex.add_argument("out", help=".geojson, .kml or .html")
+    ex.add_argument("results", help="CSV from search or refine"); ex.add_argument("out", help=".geojson, .kml or .html")
     ex.add_argument("--top", type=int, default=20); ex.add_argument("--all-points", action="store_true", help="do not keep only the best point per flight pair")
     ex.add_argument("--truth", nargs=2, type=float, metavar=("LAT", "LON"))
 
     pl = sub.add_parser("plot", help="figures: event fit, score map, best score per flight pair, modelled curves of a candidate")
     pl.add_argument("kind", choices=("event", "map", "pairs", "candidate")); pl.add_argument("out", help="PNG path")
     pl.add_argument("--spec"); pl.add_argument("--event"); pl.add_argument("--results")
-    pl.add_argument("--events", nargs=2, metavar=("EV1_JSON", "EV2_JSON")); pl.add_argument("--traces", nargs="+")
-    pl.add_argument("--bbox", nargs=4, type=float, metavar=("LATMIN", "LATMAX", "LONMIN", "LONMAX"))
+    pl.add_argument("--events", nargs=2, metavar=("EV1_JSON", "EV2_JSON")); pl.add_argument("--day", help="day index .npz the search used")
     pl.add_argument("--rank", type=int, default=1); pl.add_argument("--harmonics", nargs="+", type=int, default=[1])
     pl.add_argument("--truth", nargs=2, type=float, metavar=("LAT", "LON")); pl.add_argument("--top", type=int, default=30)
-    pl.add_argument("--interp", choices=INTERP_METHODS, default="linear")
     pl.add_argument("--temp", type=float, metavar="C")
     _add_geoid(pl)
 
@@ -250,9 +244,10 @@ def main(argv=None):
         sp = pipeline.make_spectrogram(a.audio, a.out, hop_s=a.hop, fmin=a.fmin, fmax=a.fmax)
         print(f"wrote {a.out}: {sp.S.shape[0]} bins x {sp.S.shape[1]} frames")
     elif a.cmd == "fit":
+        from .tracks import fit_event
         sp = Spectrogram.load(a.spec)
-        ef = pipeline.fit_event(sp, a.window[0], a.window[1], a.band[0], a.band[1], harmonics=a.harmonics,
-                                objective=a.objective, **({} if a.temp is None else {"c": speed_of_sound(a.temp)}))
+        ef = fit_event(sp, a.window[0], a.window[1], a.band[0], a.band[1], harmonics=a.harmonics, objective=a.objective,
+                       **({} if a.temp is None else {"c": _c(a)}))
         js = json.dumps(ef.to_dict(), indent=1)
         print(js)
         if a.out:
@@ -261,95 +256,90 @@ def main(argv=None):
     elif a.cmd == "detect":
         from .tracks import detect_events
         sp = Spectrogram.load(a.spec)
-        c = speed_of_sound(15.0 if a.temp is None else a.temp)
-        evs = detect_events(sp, a.band[0], a.band[1], c=c, harmonics=a.harmonics, top=a.top, window_s=a.window,
+        evs = detect_events(sp, a.band[0], a.band[1], c=_c(a), harmonics=a.harmonics, top=a.top, window_s=a.window,
                             progress=lambda k, n: print(f"\r  window {k}/{n}", end="", flush=True))
         print()
+        if a.max_burst is not None:
+            evs = [e for e in evs if e.burst <= a.max_burst]
         chance = None
         if a.null:
             from .privacy import reversed_spectrogram
-            null = detect_events(reversed_spectrogram(sp), a.band[0], a.band[1], c=c, harmonics=a.harmonics, top=3,
-                                 window_s=a.window)
+            null = detect_events(reversed_spectrogram(sp), a.band[0], a.band[1], c=_c(a), harmonics=a.harmonics, top=3, window_s=a.window)
             chance = max((e.score for e in null), default=0.0)
             print(f"chance level (best score on the time-reversed spectrogram): {chance:.2f}")
-        print(f"{'rank':>4} {'t_cpa s':>9} {'f0 Hz':>7} {'v m/s':>6} {'d m':>7} {'score':>6}")
+        print(f"{'rank':>4} {'t_cpa s':>9} {'f0 Hz':>7} {'v m/s':>6} {'d m':>7} {'score':>6} {'burst':>5}")
         for i, e in enumerate(evs):
             mark = "" if chance is None else ("  above chance" if e.score > chance else "")
-            print(f"{i + 1:>4} {e.t_cpa:>9.1f} {e.f0:>7.1f} {e.v:>6.0f} {e.d:>7.0f} {e.score:>6.2f}{mark}")
+            print(f"{i + 1:>4} {e.t_cpa:>9.1f} {e.f0:>7.1f} {e.v:>6.0f} {e.d:>7.0f} {e.score:>6.2f} {e.burst:>5.2f}{mark}")
         if a.out:
             with open(a.out, "w") as fh:
                 json.dump([e.to_dict() for e in evs], fh, indent=1)
-    elif a.cmd == "extract-region":
-        pipeline.extract_region(a.archive_dir, tuple(a.bbox), a.out, prop_only=not a.keep_jets)
-    elif a.cmd == "fetch-day":
-        pipeline.fetch_region(a.date, tuple(a.bbox), a.out, prop_only=not a.keep_jets, pod=a.pod)
+    elif a.cmd == "fetch":
+        pipeline.fetch(a.date, a.out, bbox=a.bbox, archive=a.archive, prop_only=not a.keep_jets, pod=a.pod,
+                       origin=a.origin, traces_path=a.traces, from_traces=a.from_traces, interp=a.interp,
+                       calibrate=a.calibrate_baro, geoid=_geoid(a))
     elif a.cmd == "search":
+        if len(a.events) not in (1, 2) or (len(a.events) == 1) != (a.utc is not None):
+            ap.error("give two events, or one event with --utc")
+        t0 = time.time()
         sp = Spectrogram.load(a.spec)
-        ev1, ev2 = (load_event(p) for p in a.events)
-        geoid = _geoid(a)
-        traces = _traces(a, geoid)
-        elev = None if a.no_dem else Terrain().elevation
+        evs = [load_event(p) for p in a.events]
+        ev1, ev2 = evs[0], (evs[1] if len(evs) == 2 else None)
+        harm = tuple(a.harmonics) + (1,) * (2 - len(a.harmonics))
+        idx = DayIndex.load(a.day)
+        pipeline.log(f"index: {len(idx)} segments, {len(idx.t)} points, loaded in {time.time() - t0:.0f} s")
+        elev = None if a.no_dem else Terrain(zoom=a.dem_zoom).elevation
+        points = None
         if a.point:
-            el = np.maximum(elev(np.array([a.point[0]]), np.array([a.point[1]])), 0.0) if elev else np.zeros(1)
-            grid = Grid.points([a.point[0]], [a.point[1]], el, geoid_fn=geoid)
-        elif a.bbox:
-            grid = Grid.make(*a.bbox, a.spacing, elev, geoid)
-        else:
-            ap.error("search needs --bbox or --point")
-        c, wind = _medium(a, grid.lat0, grid.lon0, _median_time(traces))
-        funnel = {"offset": a.funnel}
-        res, segs = pipeline.run_search(sp, ev1, ev2, traces, grid, harmonics=tuple(a.harmonics),
-                                        silence_d_m=None if a.no_silence else 6000.0, tol_s=a.tol, cpa_cache=a.cpa_cache,
-                                        v_tol=a.v_tol, d_tol=tuple(a.d_tol), score_mode=a.score, c=c, wind=wind,
-                                        interp=a.interp, funnel=funnel)
-        res["lat0"] = grid.lat0; res["lon0"] = grid.lon0
+            la, lo = np.array([a.point[0]]), np.array([a.point[1]])
+            points = (la, lo, np.maximum(elev(la, lo), 0.0) if elev else np.zeros(1))
+        geoid = _geoid(a)
+        t_utc = parse_utc(a.utc) if a.utc else None
+        mlat, mlon = (a.point if a.point else ((a.bbox[0] + a.bbox[1]) / 2, (a.bbox[2] + a.bbox[3]) / 2) if a.bbox else (idx.lat0, idx.lon0))
+        c, wind = _medium(a, mlat, mlon, t_utc if t_utc is not None else float(np.median(idx.t)))
+        res = run_search(sp, ev1, ev2, idx, harmonics=harm, tol_s=a.tol, v_tol=a.v_tol, d_tol=tuple(a.d_tol),
+                         silence_d_m=None if a.no_silence else 6000.0, max_range_m=a.max_range, spacing_m=a.spacing, coarse_m=a.coarse,
+                         elevation=elev, score_mode=a.score, workers=a.workers, cand_cache=a.cands, bbox=a.bbox, points=points,
+                         t_heard_unix=t_utc, c=c, wind=wind, geoid=geoid, funnel={})
         res.to_csv(a.out, index=False)
-        print(res.head(20).to_string())
+        pipeline.log(f"wrote {a.out}")
+        print(pipeline.best_per_pair(res).head(a.top).to_string())
+        print(verdict(res))
         if len(res):
             from datetime import datetime, timezone
-            b = res.iloc[0]
-            print(f"best: {b.icao1}/{b.icao2} at {b.lat:.6f}, {b.lon:.6f}; recording starts "
-                  f"{datetime.fromtimestamp(b.rec_start_unix, timezone.utc).isoformat()}")
+            print(f"the best row implies the recording started {datetime.fromtimestamp(float(res.rec_start_unix.iloc[0]), timezone.utc).isoformat()}")
+        if a.extra:
+            extra = [load_event(p) for p in a.extra]
+            xh = list(a.extra_harmonics) + [1] * (len(extra) - len(a.extra_harmonics))
+            res = rescore_with_extra(sp, ev1, extra, idx, res, extra_harmonics=xh, top_pairs=a.top_pairs, score_mode=a.score,
+                                     max_range_m=a.max_range, workers=a.workers, c=c, wind=wind, geoid=geoid)
+            out = a.out_extra or (a.out[:-4] + "_extra.csv" if a.out.endswith(".csv") else a.out + "_extra.csv")
+            res.to_csv(out, index=False)
+            pipeline.log(f"wrote {out}")
+            print(pipeline.best_per_pair(res).head(a.top).to_string())
+            print(verdict(res))
     elif a.cmd == "refine":
         import pandas as pd
         sp = Spectrogram.load(a.spec)
         ev1, ev2 = (load_event(p) for p in a.events)
         extra = [load_event(p) for p in a.extra]
         xh = list(a.extra_harmonics) + [1] * (len(extra) - len(a.extra_harmonics))
-        res = pd.read_csv(a.results)
-        best = res.sort_values("score", ascending=False).drop_duplicates(["icao1", "icao2"]).reset_index(drop=True)
-        row = best.iloc[a.rank - 1]
-        geoid = _geoid(a)
-        traces = _traces(a, geoid)
+        row = pipeline.best_per_pair(pd.read_csv(a.results)).iloc[a.rank - 1]
+        idx = DayIndex.load(a.day)
+        if idx.icao[int(row.seg1)] != row.icao1 or idx.icao[int(row.seg2)] != row.icao2:
+            ap.error(f"{a.results} was not made from {a.day} (segment {row.seg1} is {idx.icao[int(row.seg1)]}, not {row.icao1})")
         elev = None if a.no_dem else Terrain().elevation
-        segs = pipeline.segments_for_search(traces, tuple(a.bbox), float(row.lat0), float(row.lon0), interp=a.interp)
-        row = pipeline.relocate_row(row, segs, ev2.t_cpa - ev1.t_cpa)
         print(f"refining rank {a.rank}: {row.icao1}/{row.icao2} at {row.lat:.5f}, {row.lon:.5f} (score {row.score:.2f})")
         c, wind = _medium(a, float(row.lat), float(row.lon), float(row.t_heard1))
-        fine = pipeline.refine(sp, ev1, ev2, segs, row, spacing_m=a.spacing, half_m=a.half, harmonics=tuple(a.harmonics),
-                               elevation=elev, extra=extra, extra_harmonics=xh, score_mode=a.score, c=c, wind=wind,
-                               geoid=geoid)
+        fine = pipeline.refine(sp, ev1, ev2, idx, row, spacing_m=a.spacing, half_m=a.half, harmonics=tuple(a.harmonics),
+                               elevation=elev, extra=extra, extra_harmonics=xh, score_mode=a.score, c=c, wind=wind, geoid=_geoid(a))
         fine.to_csv(a.out, index=False)
         b = fine.iloc[0]
         print(f"peak score {b.score:.2f} at {b.lat:.6f}, {b.lon:.6f}" + (f"; extra flights {fine.attrs['extra_icao']}" if extra else ""))
         for f, (n, rmax) in pipeline.peak_spread(fine).items():
             print(f"  {n} fine points within {f:.0%} of the peak, the farthest {rmax:.0f} m from it")
         print(fine.head(10).to_string())
-    elif a.cmd == "search-single":
-        sp = Spectrogram.load(a.spec)
-        ev = load_event(a.event)
-        geoid = _geoid(a)
-        traces = _traces(a, geoid)
-        t_unix = parse_utc(a.utc)
-        elev = None if a.no_dem else Terrain().elevation
-        grid = Grid.make(*a.bbox, a.spacing, elev, geoid)
-        c, wind = _medium(a, grid.lat0, grid.lon0, t_unix)
-        res, segs = pipeline.run_single_search(sp, ev, traces, grid, t_unix, tol_s=a.tol, harmonics=a.harmonics,
-                                               v_tol=a.v_tol, d_tol=tuple(a.d_tol), score_mode=a.score, c=c, wind=wind,
-                                               interp=a.interp)
-        res["lat0"] = grid.lat0; res["lon0"] = grid.lon0
-        res.to_csv(a.out, index=False)
-        print(res.head(20).to_string())
+
     elif a.cmd == "explain":
         _explain(a)
     elif a.cmd == "trace-line":
@@ -364,31 +354,29 @@ def main(argv=None):
         _plot(a, ap)
 
 
+
+
 def _explain(a):
-    from .doppler import curve_from_trajectory, explain
-    from .geo import lla_to_enu
-    geoid = _geoid(a)
-    traces = [t for t in _traces(a, geoid) if t.icao == a.icao]
-    if not traces:
-        raise SystemExit(f"{a.icao} is not in these traces")
+    from .doppler import curve_from_trajectory, describe_c, explain
+    from .search import observer_enu
+    idx = DayIndex.load(a.day)
     t_r = parse_utc(a.utc)
-    lat, lon = a.point
-    el = a.elev if a.elev is not None else float(Terrain().elevation(np.array([lat]), np.array([lon]))[0])
-    c, wind = _medium(a)
-    from .search import build_segments
-    segs = [s for s in build_segments(traces, lat, lon, interp=a.interp) if s.t[0] <= t_r <= s.t[-1] + 120]
+    segs = [s for s in idx.segs if s.icao == a.icao and s.t[0] <= t_r <= s.t[-1] + 120]
     if not segs:
-        raise SystemExit(f"{a.icao} has no airborne segment around that time")
+        raise SystemExit(f"{a.icao} has no airborne segment in {a.day} around that time")
     seg = segs[0]
-    obs = lla_to_enu(lat, lon, el + (float(geoid(np.array([lat]), np.array([lon]))[0]) if geoid else 0.0), lat, lon)
+    lat, lon = a.point
+    el = a.elev if a.elev is not None else max(float(Terrain().elevation(np.array([lat]), np.array([lon]))[0]), 0.0)
+    geoid = _geoid(a)
+    obs = observer_enu(np.array([lat]), np.array([lon]), np.array([el]), idx.lat0, idx.lon0, geoid)[0]
+    c, wind = _medium(a)
     d = explain(t_r, seg.t, seg.enu, obs, a.f0, c=c, wind=wind)
     p, v = d["pos"], d["vel"]
-    print(f"Building the Doppler curve, step by step ({a.icao}, observer {lat:.6f}, {lon:.6f}, {el:.0f} m)")
+    print(f"Building the Doppler curve, step by step ({a.icao}, observer {lat:.6f}, {lon:.6f}, {el:.0f} m above sea level)")
     print(f"  1. reception time        t_r = {d['t_r']:.2f}")
-    from .doppler import describe_c
     print(f"  2. solve t_r = t_e + r(t_e)/c, c = {describe_c(c)}" + (f" (along this ray {d['c_eff']:.1f} m/s)" if wind or not isinstance(c, float) else ""))
     print(f"     emission time         t_e = {d['t_e']:.3f}  (sound in flight {d['delay_s']:.3f} s)")
-    print(f"  3. aircraft at t_e       position E {p[0]:.0f}, N {p[1]:.0f}, U {p[2]:.0f} m; velocity ({v[0]:.1f}, {v[1]:.1f}, {v[2]:.1f}) m/s")
+    print(f"  3. aircraft at t_e       position E {p[0] - obs[0]:.0f}, N {p[1] - obs[1]:.0f}, U {p[2] - obs[2]:.0f} m from the observer; velocity ({v[0]:.1f}, {v[1]:.1f}, {v[2]:.1f}) m/s")
     print(f"     slant range           r = {d['r']:.0f} m")
     print(f"     radial speed          v_r = {d['v_r']:.2f} m/s (positive receding)")
     print(f"  4. Doppler               f = f0 c / (c + v_r) = {a.f0:.1f} * {d['c_eff']:.1f} / ({d['c_eff']:.1f} + {d['v_r']:.2f}) = {d['f']:.2f} Hz")
@@ -503,7 +491,7 @@ def _plot(a, ap):
     import pandas as pd
     from . import plots
     need = {"event": ("spec", "event"), "map": ("results",), "pairs": ("results",),
-            "candidate": ("spec", "results", "events", "traces", "bbox")}[a.kind]
+            "candidate": ("spec", "results", "events", "day")}[a.kind]
     missing = [k for k in need if getattr(a, k) is None]
     if missing:
         ap.error(f"plot {a.kind} needs " + ", ".join("--" + k for k in missing))
@@ -517,29 +505,18 @@ def _plot(a, ap):
         fig, ax = plt.subplots(figsize=(9, 4))
         plots.plot_pair_scores(pd.read_csv(a.results), top=a.top, ax=ax)
     else:
-        from .geo import lla_to_enu
+        from .search import observer_enu
         sp = Spectrogram.load(a.spec)
         ev1, ev2 = (load_event(p) for p in a.events)
-        res = pd.read_csv(a.results)
-        best = res.sort_values("score", ascending=False).drop_duplicates(["icao1", "icao2"]).reset_index(drop=True)
-        row = best.iloc[a.rank - 1]
-        geoid = _geoid(a)
-        traces = load_many(a.traces)
-        if geoid is not None:
-            from .adsb import baro_to_ellipsoid
-            baro_to_ellipsoid(traces, geoid)
-        segs = pipeline.segments_for_search(traces, tuple(a.bbox), float(row.lat0), float(row.lon0), interp=a.interp)
-        row = pipeline.relocate_row(row, segs, ev2.t_cpa - ev1.t_cpa)
+        row = pipeline.best_per_pair(pd.read_csv(a.results)).iloc[a.rank - 1]
+        idx = DayIndex.load(a.day)
         el = max(float(Terrain().elevation(np.array([row.lat]), np.array([row.lon]))[0]), 0.0)
-        if geoid is not None:
-            el += float(geoid(np.array([row.lat]), np.array([row.lon]))[0])
-        obs = lla_to_enu(row.lat, row.lon, el, row.lat0, row.lon0)
+        obs = observer_enu(np.array([row.lat]), np.array([row.lon]), np.array([el]), idx.lat0, idx.lon0, _geoid(a))[0]
         off = ev1.t_cpa - float(row.t_heard1) + float(row["shift"])
         h = list(a.harmonics) + [a.harmonics[-1]] * (2 - len(a.harmonics))
-        c = speed_of_sound(15.0 if a.temp is None else a.temp)
         fig, axs = plt.subplots(1, 2, figsize=(13, 4))
         for ax, ev, k, hh, lab in ((axs[0], ev1, "seg1", h[0], row.icao1), (axs[1], ev2, "seg2", h[1], row.icao2)):
-            plots.plot_modelled(sp, ev, segs[int(row[k])], obs, off, harmonics=hh, ax=ax, c=c,
+            plots.plot_modelled(sp, ev, idx.segs[int(row[k])], obs, off, harmonics=hh, ax=ax, c=_c(a),
                                 label=f"{lab} at {row.lat:.5f}, {row.lon:.5f}")
     fig.tight_layout(); fig.savefig(a.out, dpi=150)
     print(f"wrote {a.out}")
@@ -547,3 +524,4 @@ def _plot(a, ap):
 
 if __name__ == "__main__":
     main()
+

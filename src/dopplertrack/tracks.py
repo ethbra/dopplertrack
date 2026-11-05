@@ -22,6 +22,7 @@ class EventFit:
     score: float        # mean whitened dB along the fitted curve
     f_pre: float
     f_post: float
+    burst: float = 0.0  # share of the 3 minutes around t_cpa that is a broadband burst (a train, a truck)
     # optional traced line of the fundamental, [[t, f], ...] (recording s, Hz): written by
     # `dopplertrack trace-line` from the automatic ridge or a hand-traced CSV, scored by
     # score mode "line" (the video scores its faint curve by distance from such a line)
@@ -32,6 +33,22 @@ class EventFit:
         if d["line"] is None:
             del d["line"]
         return d
+
+
+def burst_mask(sp: Spectrogram, smooth_s: float = 10.0, n_sigma: float = 3.0) -> np.ndarray:
+    """Frames where the whole band is loud at once: the median over frequency of the whitened
+    spectrogram, smoothed, more than n_sigma robust sigmas above its median. A vehicle passing
+    the microphone makes one of these, and its engine tone sweeps like an aircraft's."""
+    L = np.median(sp.S, axis=0)
+    k = max(int(round(smooth_s / (sp.t[1] - sp.t[0]))), 1)
+    Ls = np.convolve(L, np.ones(k) / k, "same")
+    sig = (np.quantile(Ls, 0.84) - np.quantile(Ls, 0.16)) / 2
+    return Ls > np.median(Ls) + n_sigma * sig
+
+
+def burst_fraction(mask: np.ndarray, t: np.ndarray, t_cpa: float, half_s: float = 90.0) -> float:
+    sel = (t >= t_cpa - half_s) & (t <= t_cpa + half_s)
+    return float(mask[sel].mean()) if sel.any() else 0.0
 
 
 def local_whiten(sp: Spectrogram, floor: float = 0.0) -> Spectrogram:
@@ -276,4 +293,7 @@ def detect_events(sp: Spectrogram, f_lo: float, f_hi: float, c: float | None = N
             final.append(e)
         if len(final) >= top:
             break
+    mask = burst_mask(sp)
+    for e in final:
+        e.burst = burst_fraction(mask, sp.t, e.t_cpa)
     return final

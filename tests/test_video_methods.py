@@ -221,22 +221,34 @@ def test_calibrate_baro_lifts_baro_only_aircraft():
 
 def test_funnel_and_recording_clock(synthetic):
     s = synthetic
-    grid = search.Grid.make(LAT0 - 0.05, LAT0 + 0.05, LON0 - 0.06, LON0 + 0.06, 500.0)
-    funnel = {"offset": True}
-    res, segs = pipeline.run_search(s["sp"], s["ev1"], s["ev2"], s["traces"], grid, c=C, tol_s=8.0,
-                                    silence_d_m=None, funnel=funnel, progress=False)
-    assert set(funnel) == {"offset", "speed_distance", "silence"}
-    assert funnel["offset"]["points"] >= funnel["speed_distance"]["points"] >= funnel["silence"]["points"] > 0
-    # the synthetic recording's first sample is at T0
-    assert res.rec_start_unix.iloc[0] == pytest.approx(T0, abs=2.0)
+    idx = search.DayIndex.build(s["traces"], LAT0, LON0)
+    funnel = {}
+    res = search.run_search(s["sp"], s["ev1"], s["ev2"], idx, c=C, tol_s=8.0, workers=1, funnel=funnel, log=lambda m: None)
+    assert set(funnel) == {"join", "gates", "silence"}
+    assert funnel["join"]["pairs"] >= funnel["gates"]["pairs"] >= funnel["silence"]["pairs"] > 0
+    assert funnel["gates"]["points"] >= funnel["silence"]["points"] > 0
+    # the synthetic recording's first sample is at T0: check the clock at the true location
+    # (the nationwide search also finds this gently turning pair's mirror point, 7.8 km away)
+    from dopplertrack.geo import haversine_m
+    near = res[haversine_m(res.lat, res.lon, LAT0, LON0) < 300].iloc[0]
+    assert near.rec_start_unix == pytest.approx(T0, abs=2.0)
 
 
-def test_search_with_hermite_and_wind_still_finds_the_observer(synthetic):
+def test_search_with_every_model_option_still_finds_the_observer(synthetic):
+    """Hermite paths, a lapse-rate atmosphere, wind and a geoid all at once: the synthetic
+    audio was made with none of them (still air, 340 m/s, one datum), so this checks that the
+    plumbing works end to end and the mismatch costs little, not that they help. Points on a
+    local grid (this gently turning pair also has a mirror point 7.8 km away, which a
+    nationwide search finds; test_pipeline_synthetic covers that geometry)."""
+    from dopplertrack.doppler import Atmosphere
     s = synthetic
-    grid = search.Grid.make(LAT0 - 0.03, LAT0 + 0.03, LON0 - 0.04, LON0 + 0.04, 500.0)
-    res, _ = pipeline.run_search(s["sp"], s["ev1"], s["ev2"], s["traces"], grid, c=C, tol_s=8.0, silence_d_m=None,
-                                 interp="hermite", wind=(1.0, 0.5), progress=False)
+    idx = search.DayIndex.build(s["traces"], LAT0, LON0, interp="hermite")
+    g = search.Grid.make(LAT0 - 0.027, LAT0 + 0.027, LON0 - 0.036, LON0 + 0.036, 250.0)
+    res = search.run_search(s["sp"], s["ev1"], s["ev2"], idx, c=Atmosphere.standard(18.0), wind=(1.0, 0.5), tol_s=8.0,
+                            silence_d_m=None, workers=1, geoid=lambda la, lo: np.full_like(np.asarray(la, float), -30.0),
+                            points=(g.lat, g.lon, g.elev), log=lambda m: None)
     b = res.iloc[0]
+    assert (b.icao1, b.icao2) == ("aaa001", "aaa002")
     assert np.hypot((b.lat - LAT0) * 111320, (b.lon - LON0) * 111320 * np.cos(np.radians(LAT0))) < 600
 
 

@@ -99,6 +99,12 @@ def is_profile(c) -> bool:
     return isinstance(c, Atmosphere)
 
 
+def nominal_speed(c) -> float:
+    """One number for arithmetic that needs a scalar (search gates and lag windows, which
+    have seconds of tolerance): the mean speed from the ground to 1.5 km for a profile."""
+    return float(c.mean_speed(0.0, 1500.0)) if is_profile(c) else float(c)
+
+
 def describe_c(c) -> str:
     return repr(c) if is_profile(c) else f"{float(c):.1f} m/s"
 

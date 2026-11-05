@@ -12,7 +12,7 @@ import pytest
 from dopplertrack import adsb
 from dopplertrack.geo import lla_to_enu
 from dopplertrack.geoid import Geoid
-from dopplertrack.search import Grid
+from dopplertrack.search import observer_enu
 
 DATA = Path(__file__).parent / "data"
 TRACE = DATA / "trace_full_a2f38b.json"
@@ -55,12 +55,13 @@ def test_adsb_geometric_altitude_is_ellipsoidal_height(trace, geoid):
     assert abs(np.median(diff)) > 25                              # and it is far from zero
 
 
-def test_grid_puts_observers_on_the_ellipsoid(geoid):
-    g0 = Grid.make(40.85, 40.90, -73.55, -73.50, 1000.0, lambda la, lo: np.full_like(la, 20.0))
-    g1 = Grid.make(40.85, 40.90, -73.55, -73.50, 1000.0, lambda la, lo: np.full_like(la, 20.0), geoid.undulation)
-    assert np.allclose(g1.elev, g0.elev)                          # elev stays MSL
-    du = g1.enu[:, 2] - g0.enu[:, 2]
-    assert np.allclose(du, geoid.undulation(g1.lat, g1.lon), atol=0.01)
+def test_observers_sit_on_the_ellipsoid(geoid):
+    la, lo = np.array([40.86, 40.88, 40.89]), np.array([-73.54, -73.52, -73.51])
+    el = np.full(3, 20.0)
+    e0 = observer_enu(la, lo, el, 40.87, -73.52)
+    e1 = observer_enu(la, lo, el, 40.87, -73.52, geoid.undulation)
+    assert np.allclose(e1[:, 2] - e0[:, 2], geoid.undulation(la, lo), atol=0.01)
+    assert np.allclose(e1[:, :2], e0[:, :2], atol=0.01)
 
 
 def test_baro_to_ellipsoid_moves_only_baro_only_reports(trace, geoid):

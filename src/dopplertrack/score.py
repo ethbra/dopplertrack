@@ -42,6 +42,7 @@ class EventWindow:
     mode: str = "brightness"
     ridge_sigma: float = RIDGE_SIGMA
     ridge_data: tuple | None = field(default=None, repr=False, compare=False)   # (t, f[h], w[h])
+    _tq_cache: dict = field(default_factory=dict, repr=False, compare=False)   # n -> (tq, window sampled at tq)
 
     @classmethod
     def from_fit(cls, sp: Spectrogram, fit: EventFit, harmonics: int = 1, pad_s: float = 40.0,
@@ -119,7 +120,40 @@ class EventWindow:
         count as zero); same convention as sweep_scores, for a single placement."""
         return float(self.sweep_scores(t_audio, ratio, [0.0], [f0_scale])[0, 0])
 
-    def sweep_scores(self, t_audio, ratio, shifts, f0_scales, n=160) -> np.ndarray:
+    def _time_sampled(self, n: int):
+        """(tq, Sq): the n query times of the fit window and the window's brightness
+        interpolated onto them, Sq (n, F) float32. The query times are the same for every
+        shift, f0 scale and harmonic (a shift moves the modelled curve, not the sample
+        times), so the time half of the bilinear sample is done once per window; what is
+        left per sample is a linear interpolation along frequency inside a ~200 KB array,
+        which keeps the sweep in cache and lets it scale across a process pool."""
+        if n not in self._tq_cache:
+            tq = np.linspace(self.fit.t_start, self.fit.t_end, n)
+            nf = len(self.sp.f)
+            Sq = self.sp.sample(np.repeat(tq, nf), np.tile(self.sp.f, n)).reshape(n, nf).astype(np.float32)
+            self._tq_cache[n] = (tq, Sq)
+        return self._tq_cache[n]
+
+    def _sample_at_tq(self, h: int, F, Sq):
+        """Per-sample evidence for harmonic h at frequencies F (s, K, n) placed on the query
+        times; brightness from the time-sampled window, the ridge kernel in mode="ridge"."""
+        if self.mode != "brightness":
+            tq = self._tq_cache[Sq.shape[0]][0]
+            T = np.broadcast_to(tq[None, None, :], F.shape)
+            v = self._sample(h, T.ravel(), np.nan_to_num(F.ravel(), nan=-1.0)).reshape(F.shape)
+            return np.where(np.isfinite(F), v, 0.0)
+        nf = Sq.shape[1]
+        with np.errstate(invalid="ignore"):
+            fi = (F - self.sp.f[0]) / self.sp.df
+            ok = (fi >= 0) & (fi <= nf - 1)
+        fi = np.where(ok, fi, 0.0)
+        j0 = fi.astype(np.int64); j1 = np.minimum(j0 + 1, nf - 1)
+        wf = (fi - j0).astype(np.float32)
+        k = np.broadcast_to(np.arange(F.shape[-1])[None, None, :], F.shape)
+        v = Sq[k, j0] * (1.0 - wf) + Sq[k, j1] * wf
+        return np.where(ok, v, 0.0)
+
+    def sweep_scores(self, t_audio, ratio, shifts, f0_scales, n=160, chunk=8) -> np.ndarray:
         """Scores for every (shift, f0_scale) combination in one vectorised pass.
         The curve is resampled onto n points of the fit window for each shift.
 
@@ -128,19 +162,21 @@ class EventWindow:
         the parts of the window the modelled curve does not cover counting as zero. A flight
         whose trajectory only explains half the measured sweep (it took off, landed or left
         the data mid-pass) therefore earns half the score, instead of being judged only where
-        it happens to fit."""
-        tq = np.linspace(self.fit.t_start, self.fit.t_end, n)
-        rel = tq[None, :] - np.asarray(shifts)[:, None]                       # (S, n) un-shifted audio time
+        it happens to fit.
+
+        Shifts are evaluated `chunk` at a time so the temporaries stay a few hundred KB."""
+        tq, Sq = self._time_sampled(n)
+        shifts = np.asarray(shifts, float); f0_scales = np.asarray(f0_scales, float)
+        rel = tq[None, :] - shifts[:, None]                                   # (S, n) un-shifted audio time
         ok = np.isfinite(ratio)
         rat = np.interp(rel, t_audio[ok], ratio[ok], left=np.nan, right=np.nan)  # (S, n)
         valid = np.isfinite(rat).sum(1) >= 10                                  # (S,)
         total = np.zeros((len(shifts), len(f0_scales)))
-        for h in range(1, self.harmonics + 1):
-            F = h * self.fit.f0 * np.asarray(f0_scales)[None, :, None] * rat[:, None, :]   # (S, K, n)
-            T = np.broadcast_to(tq[None, None, :], F.shape)
-            v = self._sample(h, T.ravel(), np.nan_to_num(F.ravel(), nan=-1.0)).reshape(F.shape)
-            v = np.where(np.isfinite(F), v, 0.0)
-            total += v.sum(axis=2) / n
+        for a in range(0, len(shifts), chunk):
+            r = rat[a:a + chunk]
+            for h in range(1, self.harmonics + 1):
+                F = h * self.fit.f0 * f0_scales[None, :, None] * r[:, None, :]   # (s, K, n)
+                total[a:a + chunk] += self._sample_at_tq(h, F, Sq).sum(axis=2, dtype=np.float64) / n
         total[~valid] = 0.0
         return total / self.harmonics
 
