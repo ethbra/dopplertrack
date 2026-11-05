@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `explain` prints the video's step-by-step Doppler panel for one flight in a day index, one
+  observer and one heard time: the emission time solved from t_r = t_e + r(t_e)/c, the
+  aircraft's position and velocity then, slant range, radial speed and heard frequency, and
+  what the reception-time model gives instead (`--plot` draws the three curves).
+  `doppler.explain` reproduces the panel's numbers (16.910 s, 2775 m, 121.16 m/s, 96.07 Hz).
+
 - `dopplertrack.verdict`: the winner of a search is judged against the wrong
   pairs the same search scored (an exponential upper tail fitted on the best
   wrong pairs; p is the chance a wrong winner would lead the next wrong pair by

@@ -1,4 +1,4 @@
-"""dopplertrack command line: spectrogram, detect, fit, fetch, search, refine."""
+"""dopplertrack command line: spectrogram, detect, fit, fetch, search, refine, explain."""
 from __future__ import annotations
 
 import argparse
@@ -100,6 +100,14 @@ def main(argv=None):
     rf.add_argument("--extra-harmonics", nargs="*", type=int, default=[])
     rf.add_argument("--no-dem", action="store_true"); rf.add_argument("--score", **SCORE)
 
+    x = sub.add_parser("explain", help="the video's step-by-step Doppler panel: one flight, one observer, one heard time")
+    x.add_argument("--day", required=True, help="day index .npz from fetch"); x.add_argument("--icao", required=True)
+    x.add_argument("--point", nargs=2, type=float, required=True, metavar=("LAT", "LON"))
+    x.add_argument("--utc", required=True, help="heard time, unix seconds or ISO-8601 UTC")
+    x.add_argument("--f0", type=float, default=100.0, help="rest frequency, Hz")
+    x.add_argument("--elev", type=float, help="observer height, m (default: terrain)")
+    x.add_argument("--plot", metavar="PNG", help="also plot the curve against emission time, heard time, and the reception-time model")
+
     a = ap.parse_args(argv)
     if a.cmd == "spectrogram":
         sp = pipeline.make_spectrogram(a.audio, a.out, hop_s=a.hop, fmin=a.fmin, fmax=a.fmax)
@@ -181,6 +189,45 @@ def main(argv=None):
         b = fine.iloc[0]
         print(f"peak score {b.score:.2f} at {b.lat:.6f}, {b.lon:.6f}" + (f"; extra flights {fine.attrs['extra_icao']}" if extra else ""))
         print(fine.head(10).to_string())
+    elif a.cmd == "explain":
+        _explain(a)
+
+
+def _explain(a):
+    from .doppler import curve_from_trajectory, explain
+    from .geo import lla_to_enu
+    idx = DayIndex.load(a.day)
+    t_r = parse_utc(a.utc)
+    segs = [s for s in idx.segs if s.icao == a.icao and s.t[0] <= t_r <= s.t[-1] + 120]
+    if not segs:
+        raise SystemExit(f"{a.icao} has no airborne segment in {a.day} around {a.utc}")
+    seg = segs[0]
+    lat, lon = a.point
+    el = a.elev if a.elev is not None else float(Terrain().elevation(np.array([lat]), np.array([lon]))[0])
+    obs = lla_to_enu(lat, lon, el, idx.lat0, idx.lon0)
+    d = explain(t_r, seg.t, seg.enu, obs, a.f0)
+    p, v = np.array(d["pos"]) - obs, d["vel"]
+    print(f"{a.icao} heard at {lat:.6f}, {lon:.6f} ({el:.0f} m)")
+    print(f"  heard time      t_r = {d['t_r']:.2f}")
+    print(f"  emission time   t_e = {d['t_e']:.3f}, from t_r = t_e + r(t_e)/c with c = {d['c']:.1f} m/s ({d['delay_s']:.3f} s in flight)")
+    print(f"  aircraft at t_e {p[0]:.0f} m E, {p[1]:.0f} m N, {p[2]:.0f} m up of the observer, moving ({v[0]:.1f}, {v[1]:.1f}, {v[2]:.1f}) m/s")
+    print(f"  slant range     r = {d['r']:.0f} m, radial speed v_r = {d['v_r']:.2f} m/s")
+    print(f"  heard frequency f = f0 c / (c + v_r) = {d['f']:.2f} Hz for f0 = {a.f0:g} Hz")
+    print(f"  reception-time model: v_r = {d['v_r_reception_model']:.2f} m/s, f = {d['f_reception_model']:.2f} Hz")
+    if a.plot:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        to, f, _ = curve_from_trajectory(seg.t, seg.enu, obs, a.f0)
+        _, fw, _ = curve_from_trajectory(seg.t, seg.enu, obs, a.f0, model="reception")
+        m = np.abs(to - t_r) < 300
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.plot(seg.t[m] - t_r, f[m], label="against emission time")
+        ax.plot(to[m] - t_r, f[m], label="heard")
+        ax.plot(to[m] - t_r, fw[m], "--", label="reception-time model")
+        ax.axvline(0, color="k", lw=0.5)
+        ax.set_xlabel("s from t_r"); ax.set_ylabel("Hz"); ax.legend(); fig.tight_layout(); fig.savefig(a.plot, dpi=150)
+        print(f"wrote {a.plot}")
 
 
 if __name__ == "__main__":

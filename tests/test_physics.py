@@ -80,3 +80,63 @@ def test_cpa_from_trajectory():
     assert slant == pytest.approx(np.hypot(3000, 1000))
     assert theard == pytest.approx(300 + slant / 340.0)
     assert speed == pytest.approx(100.0)
+
+
+def _onscreen_example():
+    """The video's 'Building the Doppler Curve, Step by Step' panel: c = 343 m/s, f0 = 130 Hz;
+    at t_e = 16.910 s the aircraft is at (2367, 1264, 1020) m moving (140, 16.8, 0) m/s, the
+    slant range is 2775 m and the radial speed 121.16 m/s. The panel does not show the
+    observer, so one is put on the ground where r and v_r come out as shown."""
+    p = np.array([2367.0, 1264.0, 1020.0]); v = np.array([140.0, 16.8, 0.0]); r, vr = 2775.0, 121.16
+    rh = np.sqrt(r * r - p[2] ** 2)
+    a = np.arctan2(v[1], v[0]) + np.arccos(vr * r / (rh * np.hypot(v[0], v[1])))
+    te = np.arange(-200, 200, 0.5)
+    return te, p + np.outer(te - 16.910, v), p - np.array([rh * np.cos(a), rh * np.sin(a), p[2]])
+
+
+def test_explain_reproduces_the_videos_panel():
+    te, pos, obs = _onscreen_example()
+    d = doppler.explain(25.00, te, pos, obs, 130.0, c=343.0)
+    assert d["t_e"] == pytest.approx(16.910, abs=1e-3)
+    assert d["r"] == pytest.approx(2775, abs=0.5)
+    assert d["v_r"] == pytest.approx(121.16, abs=0.01)
+    assert d["f"] == pytest.approx(96.07, abs=0.01)
+    assert abs(d["f_reception_model"] - d["f"]) > 1.0
+
+
+def test_emission_time_solves_the_delay_equation():
+    te, pos, obs = _onscreen_example()
+    for tr in (-50.0, 0.0, 25.0, 100.0):
+        t_e = doppler.emission_time(tr, te, pos, obs, c=343.0)
+        p = np.array([np.interp(t_e, te, pos[:, k]) for k in range(3)])
+        assert t_e + np.linalg.norm(p - obs) / 343.0 == pytest.approx(tr, abs=1e-6)
+    with pytest.raises(ValueError):
+        doppler.emission_time(1e6, te, pos, obs, c=343.0)
+
+
+def test_reception_time_model_bends_the_curve():
+    te = np.arange(0, 1000, 0.5)
+    pos = np.stack([110.0 * (te - 500), np.full_like(te, 2000.0), np.full_like(te, 1500.0)], -1)
+    to, f, _ = doppler.curve_from_trajectory(te, pos, np.zeros(3), 100.0, 340.0)
+    _, fw, _ = doppler.curve_from_trajectory(te, pos, np.zeros(3), 100.0, 340.0, model="reception")
+    tq = np.arange(400, 650, 0.5)
+    right = np.interp(tq, to, f)
+    best = min(np.max(np.abs(np.interp(tq - s, to, fw) - right)) for s in np.arange(-15, 15, 0.25))
+    assert best > 0.3                          # no time shift makes it match
+    assert np.allclose(np.interp(tq, to, fw), np.interp(tq, te, f), atol=0.05)     # it is the undelayed curve (resampling differs by < 0.05 Hz)
+
+
+def test_explain_cli_on_a_day_index(tmp_path, capsys):
+    from dopplertrack import cli
+    from dopplertrack.adsb import Trace
+    from dopplertrack.search import DayIndex
+    lat0, lon0 = 40.0, -74.0
+    t = 1.7e9 + np.arange(0, 600, 5.0)
+    enu = np.stack([100.0 * (t - t[0] - 300), np.full_like(t, 2000.0), np.full_like(t, 1500.0)], -1)
+    la, lo, al = geo.enu_to_lla(enu[:, 0], enu[:, 1], enu[:, 2], lat0, lon0)
+    DayIndex.build([Trace("abc123", None, None, None, t, la, lo, al, np.full_like(t, 100.0), np.zeros(len(t), bool))],
+                   lat0, lon0).save(tmp_path / "day.npz")
+    cli.main(["explain", "--day", str(tmp_path / "day.npz"), "--icao", "abc123", "--point", str(lat0), str(lon0),
+              "--elev", "0", "--utc", str(1.7e9 + 300 + 2500 / 340.3), "--f0", "100"])
+    out = capsys.readouterr().out
+    assert "slant range     r = 2500 m" in out and "f = f0 c / (c + v_r) = 100.00 Hz" in out

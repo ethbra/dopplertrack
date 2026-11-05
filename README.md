@@ -93,6 +93,8 @@ uv run dopplertrack refine rec.npz results.csv --events ev1.json ev2.json --day 
   reruns only the scoring. `--extra` rescores the best pairs with further
   flyovers.
 - `refine` lays a 50 m grid around one result, optionally with more events.
+- `explain` prints the video's step-by-step Doppler panel for one flight, observer and
+  heard time (`--day day.npz --icao ace391 --point LAT LON --utc TIME`).
 
 ## How the search works
 
