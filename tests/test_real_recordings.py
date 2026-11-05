@@ -12,9 +12,10 @@ Traces fetched with this version keep each report's track and both altitudes, wh
 --interp hermite and --calibrate-baro need; older files still load, but those two options
 then fall back to the old behaviour.
 
-For every option set, a 50 m grid of +-1.5 km around the truth is searched with the
-committed event fits. The test asserts the answer is kept (true pair first, peak within
-500 m), and with DOPPLERTRACK_REPORT=path writes one row per (recording, option set): peak
+For every option set, a grid around the truth (Oyster Bay 50 m over +-1.5 km; the eagle
+cam 100 m over +-3 km) is searched with the committed event fits. The test asserts the
+answer is kept (true pair first; peak within 500 m at Oyster Bay, 2.5 km at the eagle cam,
+whose two overhead passes pin it to about 2 km), and with DOPPLERTRACK_REPORT=path writes one row per (recording, option set): peak
 distance from the truth, score, margin over the best other flight pair. Those rows are what
 decides whether an option becomes the default.
 """
@@ -43,17 +44,22 @@ def _ev(name, index=None):
 RECORDINGS = {
     "oyster_bay": dict(env="DOPPLERTRACK_OYSTER_BAY", traces="traces_ny.npz", truth=(40.876466, -73.524951),
                        pair=("a1dfeb", "ace391"), events=lambda: (_ev("oyster_bay_ev1.json"), _ev("oyster_bay_ev2.json")),
-                       harmonics=(2, 1)),
-    # the eagle cam's blind search used detected events 4 and 12 (338 s apart): Beech Baron then PC-12
+                       harmonics=(2, 1), heard=1788900805, half_m=1500.0, step_m=50.0, max_dist_m=500.0),
+    # two near-overhead passes pin the eagle cam only to ~2 km (README), hence the wider box and
+    # tolerance; the eagle cam's blind search used detected events 4 and 12 (338 s apart): Beech Baron then PC-12
     "swfl": dict(env="DOPPLERTRACK_SWFL", traces="traces_swfl.npz", truth=(26.702359, -81.847766),
                  pair=("a2baea", "a336e4"), events=lambda: (_ev("swfl_detected.json", 4), _ev("swfl_detected.json", 12)),
-                 harmonics=(1, 1)),
+                 harmonics=(1, 1), heard=1735415920, half_m=3000.0, step_m=100.0, max_dist_m=2500.0),
 }
 OPTIONS = {
     "baseline": dict(geoid=False, interp="linear", baro=False),     # how docs/results were made
     "geoid": dict(geoid=True, interp="linear", baro=False),
     "hermite": dict(geoid=True, interp="hermite", baro=False),
     "hermite+baro": dict(geoid=True, interp="hermite", baro=True),
+    # that afternoon's temperature profile (tests/data/weather_<recording>.json), each ray at
+    # the mean sound speed of the air it crosses, with and without the mean wind below 3 km
+    "profile": dict(geoid=True, interp="hermite", baro=False, profile=True),
+    "profile+wind": dict(geoid=True, interp="hermite", baro=False, profile=True, wind=True),
 }
 
 CASES = [(r, o) for r in RECORDINGS for o in OPTIONS]
@@ -87,15 +93,22 @@ def test_options_keep_the_answer(rec, opt, loaded):
         adsb.calibrate_baro(traces)
     elif geoid:
         adsb.baro_to_ellipsoid(traces, geoid)
+    c, wind = None, None
+    if o.get("profile"):
+        from dopplertrack.weather import profile_from_response
+        w = profile_from_response(json.load(open(Path(__file__).parent / "data" / f"weather_{rec}.json")), cfg["heard"])
+        c, wind = w["atmosphere"], (w["wind"] if o.get("wind") else None)
     lat, lon = cfg["truth"]
-    # 50 m grid over +-1.5 km, offset (17 m N, 23 m E) so that no node sits on the truth and
-    # the peak distance measures the model, not the grid
+    # grid offset (17 m N, 23 m E) so that no node sits on the truth and the peak distance
+    # measures the model, not the grid
+    h, step = cfg["half_m"], cfg["step_m"]
     m_lat, m_lon = 111320.0, 111320.0 * np.cos(np.radians(lat))
     c_lat, c_lon = lat + 17 / m_lat, lon + 23 / m_lon
-    grid = Grid.make(c_lat - 1500 / m_lat, c_lat + 1500 / m_lat, c_lon - 1500 / m_lon, c_lon + 1500 / m_lon, 50.0,
+    grid = Grid.make(c_lat - h / m_lat, c_lat + h / m_lat, c_lon - h / m_lon, c_lon + h / m_lon, step,
                      Terrain().elevation, geoid)
     ev1, ev2 = cfg["events"]()
-    res, _ = pipeline.run_search(sp, ev1, ev2, traces, grid, harmonics=cfg["harmonics"], interp=o["interp"], progress=False)
+    res, _ = pipeline.run_search(sp, ev1, ev2, traces, grid, harmonics=cfg["harmonics"], interp=o["interp"], progress=False,
+                                 c=c, wind=wind)
     assert len(res), "no candidate survived the filters"
     best = res.drop_duplicates(["icao1", "icao2"]).reset_index(drop=True)
     top = best.iloc[0]
@@ -116,4 +129,4 @@ def test_options_keep_the_answer(rec, opt, loaded):
             w.writerow(row)
     print(row)
     assert (top.icao1, top.icao2) == cfg["pair"], row
-    assert dist < 500.0, row
+    assert dist < cfg["max_dist_m"], row

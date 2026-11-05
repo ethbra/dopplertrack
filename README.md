@@ -352,15 +352,16 @@ not defaults until `tests/test_real_recordings.py` (see Validation below) says t
   off, calibrated 0.8 m (median; 12 m at the 90th percentile). That calibrates the aircraft
   from its own other blocks, which flatters it; `tests/test_real_day.py` does it across
   aircraft.
-- **Weather** (`--temp`, `--wind SPEED FROM_DEG`, `--weather`). The speed of sound follows
-  temperature (0.6 m/s per degree C). A uniform wind is modelled exactly: the sound heard at
-  t_e + tau left when |D + w tau| = c tau (D from observer to aircraft), which gives
-  f = f0 (c - m.w) / (c - m.w + m.v) with m the unit vector along that ray. The obvious shortcut
-  (a direction-dependent sound speed c + w.k with the ray straight) is off by about as much
-  as ignoring the wind, because the ray tilts by about |w|/c and that tilt multiplies the
-  aircraft's speed; the test checks the model against an exact air-frame ray solution. `--weather` reads
-  ERA5 surface temperature and wind from Open-Meteo's free archive and carries them to the
-  middle of the sound path (standard lapse rate, 1/7 power-law wind profile).
+- **Weather** (`--temp`, `--lapse`, `--wind SPEED FROM_DEG`, `--weather`). The speed of sound
+  follows temperature (0.6 m/s per degree C) and, since temperature falls with height, differs
+  from ray to ray: each ray uses the mean over the heights it crosses (see Real-data results
+  below for why). A uniform wind is modelled exactly: the sound heard at t_e + tau left when
+  |D + w tau| = c tau (D from observer to aircraft), and the heard frequency is
+  f0 / (1 + d tau / d t_e). The obvious shortcut (a direction-dependent sound speed c + w.k
+  with the ray straight) is off by about as much as ignoring the wind, because the ray tilts
+  by about |w|/c and that tilt multiplies the aircraft's speed; the test checks the model
+  against an exact air-frame ray solution. `--weather` reads the hour's temperature profile
+  and the mean wind below 3 km from Open-Meteo's historical forecast archive (pressure levels).
 - **Traced-line scoring** (`--score line`, `trace-line`). The video scores its faint curve by
   distance from a line drawn on the spectrogram. `trace-line` stores a line in the event JSON,
   from a hand-traced CSV (any tool that exports t, f points) or from the automatic ridge's
@@ -414,9 +415,10 @@ the risk went from high to medium after the first pass and to low after the seco
 | `test_real_day` | one real day of ADS-B over a region | `DOPPLERTRACK_DAY_TRACES=traces.npz` |
 | `test_oyster_bay`, `test_real_recordings` | the two recordings with known answers, and their days of ADS-B | `DOPPLERTRACK_OYSTER_BAY=dir`, `DOPPLERTRACK_SWFL=dir` |
 
-`test_real_recordings` searches a 50 m grid over +-1.5 km around each known answer under four option sets
-(the old baseline, the geoid, Hermite, Hermite with baro calibration) and asserts the right
-flight pair stays first and within 500 m; with `DOPPLERTRACK_REPORT=report.csv` it writes
+`test_real_recordings` searches around each known answer under six option sets (the old
+baseline, the geoid, Hermite, Hermite with baro calibration, and the temperature profile with
+and without wind, from the saved weather in `tests/data`) and asserts the right flight pair
+stays first and within 500 m (Oyster Bay) or 2.5 km (the eagle cam, two overhead passes); with `DOPPLERTRACK_REPORT=report.csv` it writes
 the peak distance, score and margin for each, which is the evidence for changing a default.
 Preparing the data (needs ffmpeg and yt-dlp; each day of ADS-B streams ~4 GB):
 
@@ -433,28 +435,57 @@ DOPPLERTRACK_OYSTER_BAY=data/oyster_bay DOPPLERTRACK_SWFL=data/swfl \
   uv run pytest -s tests/test_real_recordings.py tests/test_real_day.py tests/test_oyster_bay.py
 ```
 
-### First real-data results (Oyster Bay, 2026-11-05)
+### Real-data results (2026-11-05)
 
-Recording and that day's ADS-B (1,016 non-jet flights) supplied by the repository owner.
+Both recordings and their days of ADS-B were supplied by the repository owner (Oyster Bay:
+1,016 non-jet flights; eagle cam: 556). Flight-data checks, the aircraft against their own
+reports:
 
-| check | result |
-|---|---|
-| Hermite vs linear, every other report held out, whole day (730,342 reports) | median 5.9 -> 4.2 m, 90th percentile 15.0 -> 11.1 m |
-| Baro calibration across aircraft (174 aircraft's GNSS altitude hidden) | median error 68.6 -> 11.4 m, 90th percentile 282 -> 63 m |
-| Share of airborne reports with GNSS altitude that day | 99 %: `--calibrate-baro` barely matters here |
-| Right pair first, peak within 500 m, all four option sets | yes |
-| Peak distance from the truth, 10 m grid: baseline / + geoid / + Hermite | 36 m / 72 m / 43 m |
+| check | Oyster Bay day | eagle-cam day |
+|---|---|---|
+| Hermite vs linear, every other report held out (median / 90th percentile) | 5.9 / 15.0 -> 4.2 / 11.1 m (730,342 reports) | 8.4 / 21.9 -> 5.9 / 16.3 m (183,883) |
+| Baro calibration across aircraft, GNSS altitude hidden (median error) | 68.6 -> 11.4 m (174 aircraft) | 68.6 -> 2.7 m (96) |
+| Airborne reports carrying GNSS altitude | 99 % | 99 % |
 
-So the flight-data side improves measurably, but on this one recording none of the options
-moves the answer by more than the flatness of the score near its peak (each option's points
-within 1 % of the peak spread over about 50 m). What dominates instead is the speed of sound:
-at the true point the score falls from 28.4 at 10 C to 20.1 at 30 C, against about 1 point
-for the 32 m datum shift, and temperature and observer height trade off (at 10 C the geoid
-scores higher than the old datum, at 15 C lower). The recording prefers 337-340 m/s, which is
-colder than a September afternoon on Long Island is likely to have been; wind against the
-sound would do that, and the day's real weather (`--weather`) is the next thing to check.
-Until then the geoid stays on because the physics says so (the QNH check above), not because
-this recording shows it.
+**The speed of sound is per ray.** Scored with one sound speed for both flyovers, the
+Oyster Bay PC-12 (5.5 km above the observer) fits best at 337 m/s and the King Air (1.1 km)
+at 342 m/s. That afternoon's temperature profile (Open-Meteo pressure levels: 26 C at the
+ground, 13 C at 1.6 km) gives column means of 336 and 344 m/s. So `c` can now be a
+`doppler.Atmosphere`: each ray travels at the mean sound speed of the air it crosses, and
+`--weather` fetches the hour's profile (and the mean wind below 3 km); `--lapse` builds a
+standard-lapse column from `--temp`.
+
+Location, searching around each known answer with the committed event fits (Oyster Bay 10 m
+grid, eagle cam 50 m; "score" is the true pair's best score):
+
+| configuration | Oyster Bay: peak, score | eagle cam: peak, score |
+|---|---|---|
+| baseline: 15 C, old datum, linear | 66 m, 29.09 | 1,284 m, 10.21 |
+| geoid + Hermite, 15 C | 80 m, 28.41 | 1,674 m, 10.02 |
+| geoid + Hermite, the afternoon's surface temperature for every ray | 166 m, 24.39 | 1,303 m, 9.30 |
+| geoid + Hermite + profile | 105 m, 28.70 | 1,613 m, 10.24 |
+| geoid + Hermite + profile + wind | 89 m, 29.02 | 1,613 m, 10.17 |
+| old datum + linear + profile | 118 m, 28.29 | 1,739 m, 10.27 |
+
+What the two recordings say:
+
+- **None of the options moves the answer by a meaningful amount.** Every configuration finds
+  the right flight pair; Oyster Bay stays within 66-166 m, and the eagle cam stays at the
+  1.3-1.7 km its two overhead passes allow (the README's earlier 592 m used three more
+  flyovers).
+- **The obvious use of weather is harmful.** The afternoon's surface temperature (26 C) as the
+  sound speed of every ray cuts the Oyster Bay score by 16 % and moves its peak to 166 m.
+  The old 15 C default works only because 340 m/s happens to sit between the two rays' true
+  means. The profile recovers the fit (28.70-29.02) for physical reasons rather than by luck.
+- **Errors were cancelling.** With a constant 15 C, the geoid fix scores slightly worse on both
+  recordings; with the profile, it scores better at Oyster Bay (28.70 vs 28.29, peak 105 vs
+  118 m). The old datum was partly compensating for the wrong sound speed.
+
+Defaults are therefore unchanged except the geoid: `--interp hermite`, `--calibrate-baro`,
+`--weather` and `--lapse` are measurably right about the flight data and the atmosphere but
+have not improved a location on these two recordings, so they stay opt-in. Two recordings
+with known answers are too few to settle more than that; lateral, low passes (which constrain
+the location) are what the next validation recordings need.
 
 ## Changes from the method in the video
 
@@ -503,6 +534,7 @@ by flight geometry.
 | Elevation | AWS Terrain Tiles (Terrarium) |
 | Weather (optional) | Open-Meteo ERA5 archive |
 | Geoid (sea level above the ellipsoid) | NGA EGM96 15', via PROJ-data on GitHub |
+| Temperature and wind profile (optional) | Open-Meteo historical forecast API (CC BY 4.0) |
 
 ## Development
 

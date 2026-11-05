@@ -8,7 +8,7 @@ import pandas as pd
 from scipy.spatial import cKDTree
 
 from .adsb import Trace
-from .doppler import propagation_delay, speed_of_sound
+from .doppler import is_profile, propagation_delay, speed_of_sound
 from .geo import lla_to_enu, enu_to_lla
 
 
@@ -120,7 +120,10 @@ def cpa_table(grid: Grid, segs: list[Segment], max_range_m: float = 10000.0, c: 
             ok = (r <= max_range_m) & (j > 0) & (j < len(s.t) - 1)     # interior CPA only
             if not ok.any():
                 continue
-            tau = r[ok] / c if wind is None else propagation_delay(s.enu[j[ok]] - grid.enu[idx[ok]], c, wind)
+            if wind is None and not is_profile(c):
+                tau = r[ok] / c
+            else:
+                tau = propagation_delay(s.enu[j[ok]] - grid.enu[idx[ok]], c, wind, z_obs=grid.enu[idx[ok], 2])
             rows.append(pd.DataFrame({
                 "gidx": idx[ok].astype(np.int32), "seg": np.int32(si),
                 "t_emit": s.t[j[ok]], "t_heard": s.t[j[ok]] + tau,

@@ -11,7 +11,7 @@ import pandas as pd
 
 from .adsb import AircraftTypes, Trace, load_region, load_traces, save_traces
 from .audio import Spectrogram, compute_spectrogram, load_audio
-from .doppler import speed_of_sound
+from .doppler import is_profile, speed_of_sound
 from .score import EventWindow, locked_score
 from .search import Grid, Segment, build_segments, cpa_table, pair_candidates, save_cpa_table, load_cpa_table
 from .terrain import Terrain
@@ -106,7 +106,7 @@ def run_search(sp: Spectrogram, ev1: EventFit, ev2: EventFit, traces: list[Trace
     log(f"{len(segs)} airborne segments; grid of {len(grid)} points")
     cpa = None
     fp = {"grid": (len(grid), float(grid.lat0), float(grid.lon0), float(grid.lat.min()), float(grid.lon.max())),
-          "segs": (len(segs), int(sum(len(s.t) for s in segs))), "max_range_m": float(max_range_m), "c": float(c)}
+          "segs": (len(segs), int(sum(len(s.t) for s in segs))), "max_range_m": float(max_range_m), "c": repr(c) if is_profile(c) else float(c)}
     if interp != "linear":
         fp["interp"] = interp
     if wind is not None:

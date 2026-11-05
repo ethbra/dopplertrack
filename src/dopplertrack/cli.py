@@ -52,9 +52,12 @@ def _add_medium(sp, weather=True):
     sp.add_argument("--temp", type=float, metavar="C", help="air temperature for the speed of sound (default 15 C, 340.3 m/s)")
     sp.add_argument("--wind", nargs=2, type=float, metavar=("SPEED", "FROM_DEG"),
                     help="wind along the sound paths: speed m/s and the direction it blows from (deg from north)")
+    sp.add_argument("--lapse", action="store_true",
+                    help="sound speed falls with height (standard lapse from the --temp surface temperature) instead of one value for every ray")
     if weather:
         sp.add_argument("--weather", action="store_true",
-                        help="look up temperature and wind for the region and time (Open-Meteo ERA5 archive); --temp/--wind override")
+                        help="that hour's temperature profile and mean wind below 3 km (Open-Meteo pressure levels), so each ray gets the "
+                             "sound speed of the air it crosses; --temp/--wind override")
 
 
 def _add_traces(sp):
@@ -97,28 +100,23 @@ def _traces(a, geoid=None):
 
 
 def _medium(a, lat=None, lon=None, unix_t=None):
-    """(c, wind) from --temp/--wind/--weather."""
-    temp, wind = a.temp, None
+    """(c, wind) from --temp, --lapse, --wind and --weather. c is a sound speed, or a
+    doppler.Atmosphere when the sound speed varies with height (--lapse, --weather)."""
+    from .doppler import Atmosphere, describe_c
+    from .weather import wind_vector
+    c, wind = None, None
     if getattr(a, "weather", False) and lat is not None and unix_t is not None:
-        from .weather import Medium, fetch_weather
+        from .weather import fetch_profile
         try:
-            w = fetch_weather(lat, lon, unix_t)
-            m = Medium.from_surface(w["temp_c"], w["wind_speed"], w["wind_from_deg"])
-            pipeline.log(f"weather {w['time']} UTC at {lat:.3f}, {lon:.3f}: {w['temp_c']:.1f} C, wind {w['wind_speed']:.1f} m/s from {w['wind_from_deg']:.0f} deg"
-                         f" -> c = {m.c:.1f} m/s, wind at path height {m.wind}")
-            c, wind = m.c, m.wind
+            w = fetch_profile(lat, lon, unix_t)
+            c, wind = w["atmosphere"], w["wind"]
+            pipeline.log(f"weather {w['time']} UTC at {lat:.3f}, {lon:.3f}: {describe_c(c)}; mean wind below 3 km {wind}")
         except Exception as e:      # network or API trouble must not kill a long search
-            pipeline.log(f"weather lookup failed ({e}); using --temp/--wind or still air")
-            c = None
-        if a.temp is not None:
-            c = speed_of_sound(a.temp)
-        if a.wind:
-            from .weather import wind_vector
-            wind = wind_vector(*a.wind)
-        return (c if c is not None else speed_of_sound(15.0 if temp is None else temp)), wind
-    c = speed_of_sound(15.0 if temp is None else temp)
+            pipeline.log(f"weather lookup failed ({e}); using --temp/--lapse/--wind or 15 C still air")
+    if a.temp is not None or c is None:
+        t = 15.0 if a.temp is None else a.temp
+        c = Atmosphere.standard(t) if getattr(a, "lapse", False) else speed_of_sound(t)
     if a.wind:
-        from .weather import wind_vector
         wind = wind_vector(*a.wind)
     return c, wind
 
@@ -387,7 +385,8 @@ def _explain(a):
     p, v = d["pos"], d["vel"]
     print(f"Building the Doppler curve, step by step ({a.icao}, observer {lat:.6f}, {lon:.6f}, {el:.0f} m)")
     print(f"  1. reception time        t_r = {d['t_r']:.2f}")
-    print(f"  2. solve t_r = t_e + r(t_e)/c, c = {c:.1f} m/s" + (f" (along the ray {d['c_eff']:.1f} m/s with wind {wind})" if wind else ""))
+    from .doppler import describe_c
+    print(f"  2. solve t_r = t_e + r(t_e)/c, c = {describe_c(c)}" + (f" (along this ray {d['c_eff']:.1f} m/s)" if wind or not isinstance(c, float) else ""))
     print(f"     emission time         t_e = {d['t_e']:.3f}  (sound in flight {d['delay_s']:.3f} s)")
     print(f"  3. aircraft at t_e       position E {p[0]:.0f}, N {p[1]:.0f}, U {p[2]:.0f} m; velocity ({v[0]:.1f}, {v[1]:.1f}, {v[2]:.1f}) m/s")
     print(f"     slant range           r = {d['r']:.0f} m")

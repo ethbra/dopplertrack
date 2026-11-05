@@ -46,12 +46,72 @@ def ideal_curve_params_from_endpoints(f_pre, f_post, c=None):
 DOPPLER_MODELS = ("emission", "reception")
 
 
+class Atmosphere:
+    """Sound speed that varies with height: c(z) from a temperature profile.
+
+    Wherever this module takes a sound speed `c`, it also takes an Atmosphere. A ray from the
+    observer at height z_o to a source at z_s then travels at the harmonic mean of c over the
+    heights it crosses (straight-ray approximation: the delay is r times the mean slowness),
+    so a high aircraft is heard through the colder air above it. Heights are in the search
+    frame's "up" coordinate, which over a few tens of km is height above the WGS-84 ellipsoid.
+
+    The Oyster Bay recording is why this exists: scored with one sound speed for both
+    flyovers, the PC-12 at 5.5 km fits best at 337 m/s and the King Air at 1.1 km at 342 m/s,
+    on a 26 C afternoon (surface c 346 m/s)."""
+
+    def __init__(self, z, temp_c, label: str = "profile", dz: float = 10.0, z_range=(-500.0, 20000.0)):
+        z = np.asarray(z, float); temp_c = np.asarray(temp_c, float)
+        o = np.argsort(z)
+        self.z_levels, self.t_levels = z[o], temp_c[o]
+        self.label = label
+        self._zt = np.arange(z_range[0], z_range[1] + dz, dz)
+        self._c = speed_of_sound(np.interp(self._zt, self.z_levels, self.t_levels))
+        # cumulative slowness S(z) = integral of dz / c(z), trapezoidal on the table
+        self._S = np.concatenate([[0.0], np.cumsum(0.5 * (1 / self._c[1:] + 1 / self._c[:-1]) * dz)])
+
+    @classmethod
+    def standard(cls, surface_temp_c: float, surface_z: float = 0.0, lapse_k_per_m: float = 0.0065,
+                 tropopause_m: float = 11000.0):
+        """A standard-lapse column from a surface temperature: linear up to the tropopause,
+        isothermal above, constant below the surface."""
+        top = surface_temp_c - lapse_k_per_m * (tropopause_m - surface_z)
+        return cls([surface_z - 500.0, surface_z, tropopause_m, 20000.0], [surface_temp_c, surface_temp_c, top, top],
+                   label=f"standard lapse from {surface_temp_c:.1f} C at {surface_z:.0f} m")
+
+    def speed(self, z) -> np.ndarray:
+        return np.interp(z, self._zt, self._c)
+
+    def mean_speed(self, z1, z2) -> np.ndarray:
+        """Harmonic-mean sound speed between heights z1 and z2 (elementwise)."""
+        z1 = np.asarray(z1, float); z2 = np.asarray(z2, float)
+        dz = z2 - z1
+        dS = np.interp(z2, self._zt, self._S) - np.interp(z1, self._zt, self._S)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            c = dz / dS
+        return np.where(np.abs(dz) < 1.0, self.speed(0.5 * (z1 + z2)), c)
+
+    def __repr__(self):
+        lv = ", ".join(f"{z:.0f} m {t:.1f} C" for z, t in zip(self.z_levels, self.t_levels))
+        return f"Atmosphere({self.label}: {lv})"
+
+
+def is_profile(c) -> bool:
+    return isinstance(c, Atmosphere)
+
+
+def describe_c(c) -> str:
+    return repr(c) if is_profile(c) else f"{float(c):.1f} m/s"
+
+
 def _wind3(wind):
     return np.array([float(wind[0]), float(wind[1]), 0.0])
 
 
-def propagation_delay(d_src_minus_obs, c, wind=None):
+def propagation_delay(d_src_minus_obs, c, wind=None, z_obs=None):
     """Time sound takes from the source to the observer, d = source - observer (..., 3).
+
+    c: a sound speed, or an Atmosphere (then z_obs, the observer's height, is needed and each
+    ray travels at its own mean sound speed).
 
     In a uniform horizontal wind w (east, north m/s, the direction the air moves towards) sound
     moves at c relative to the air. In the air's frame the observer drifts by -w tau while the
@@ -59,6 +119,10 @@ def propagation_delay(d_src_minus_obs, c, wind=None):
     closed-form positive root used here. Without wind it is |d| / c."""
     d = np.asarray(d_src_minus_obs, float)
     r2 = np.sum(d * d, axis=-1)
+    if is_profile(c):
+        if z_obs is None:
+            raise ValueError("an Atmosphere needs the observer height z_obs")
+        c = c.mean_speed(z_obs, np.asarray(z_obs, float) + d[..., 2])
     if wind is None:
         return np.sqrt(r2) / c
     w = _wind3(wind)
@@ -93,8 +157,18 @@ def curve_from_trajectory(t_e, pos_enu, obs_enu, f0=1.0, c=None, wind=None, mode
     c = speed_of_sound() if c is None else c
     t_e = np.asarray(t_e, float)
     pos = np.asarray(pos_enu, float)
-    d = pos - np.asarray(obs_enu, float)
+    obs = np.asarray(obs_enu, float)
+    d = pos - obs
     r = np.linalg.norm(d, axis=-1)
+    if is_profile(c):
+        # general form: the heard frequency is f0 dt_e/dt_obs with t_obs = t_e + tau(t_e),
+        # exact for any delay model; with a constant c and no wind it is the formula below
+        tau = propagation_delay(d, c, wind, z_obs=obs[2])
+        t_obs = t_e + tau
+        dtau = np.gradient(tau, t_e)
+        if model == "reception":
+            dtau = np.interp(t_obs, t_e, dtau)
+        return t_obs, f0 / (1.0 + dtau), r
     if wind is None:
         ce = np.full(r.shape, float(c))
         rr = np.gradient(r, t_e)
@@ -123,7 +197,7 @@ def emission_time(t_r, t_e, pos_enu, obs_enu, c=None, wind=None) -> float:
 
     def at(te):
         p = np.array([np.interp(te, t_e, pos[:, k]) for k in range(3)])
-        return te + float(propagation_delay(p - obs, c, wind)) - t_r
+        return te + float(propagation_delay(p - obs, c, wind, z_obs=obs[2])) - t_r
 
     t_obs, _, _ = curve_from_trajectory(t_e, pos, obs, 1.0, c, wind)
     if not (t_obs[0] <= t_r <= t_obs[-1]):
@@ -144,6 +218,8 @@ def explain(t_r, t_e, pos_enu, obs_enu, f0, c=None, wind=None) -> dict:
     v = np.array([np.interp(te, t_e, vel[:, k]) for k in range(3)])
     d = p - obs
     r = float(np.linalg.norm(d))
+    if is_profile(c):                    # the rest of the panel uses this ray's mean sound speed
+        c = float(c.mean_speed(obs[2], p[2]))
     if wind is None:
         m, ce = d / r, float(c)
     else:
@@ -171,4 +247,4 @@ def cpa_from_trajectory(t_e, pos_enu, obs_enu, c=None, wind=None):
     i = int(np.argmin(r))
     vel = np.gradient(np.asarray(pos_enu, float), t_e, axis=0)
     speed = float(np.linalg.norm(vel[i]))
-    return float(t_e[i]), float(t_e[i] + propagation_delay(d[i], c, wind)), float(r[i]), speed
+    return float(t_e[i]), float(t_e[i] + propagation_delay(d[i], c, wind, z_obs=float(np.asarray(obs_enu, float)[2]))), float(r[i]), speed
