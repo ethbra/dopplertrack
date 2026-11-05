@@ -24,6 +24,9 @@ Thumbs.db
 *.webm
 *.mp4
 *.m4a
+*.flac
+*.opus
+*.ogg
 *.npz
 *.csv
 !tests/data/*
