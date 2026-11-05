@@ -12,7 +12,7 @@ Traces fetched with this version keep each report's track and both altitudes, wh
 --interp hermite and --calibrate-baro need; older files still load, but those two options
 then fall back to the old behaviour.
 
-For every option set, a 100 m grid of +-3 km around the truth is searched with the
+For every option set, a 50 m grid of +-1.5 km around the truth is searched with the
 committed event fits. The test asserts the answer is kept (true pair first, peak within
 500 m), and with DOPPLERTRACK_REPORT=path writes one row per (recording, option set): peak
 distance from the truth, score, margin over the best other flight pair. Those rows are what
@@ -88,8 +88,12 @@ def test_options_keep_the_answer(rec, opt, loaded):
     elif geoid:
         adsb.baro_to_ellipsoid(traces, geoid)
     lat, lon = cfg["truth"]
-    dlat, dlon = 3000 / 111320, 3000 / (111320 * np.cos(np.radians(lat)))
-    grid = Grid.make(lat - dlat, lat + dlat, lon - dlon, lon + dlon, 100.0, Terrain().elevation, geoid)
+    # 50 m grid over +-1.5 km, offset (17 m N, 23 m E) so that no node sits on the truth and
+    # the peak distance measures the model, not the grid
+    m_lat, m_lon = 111320.0, 111320.0 * np.cos(np.radians(lat))
+    c_lat, c_lon = lat + 17 / m_lat, lon + 23 / m_lon
+    grid = Grid.make(c_lat - 1500 / m_lat, c_lat + 1500 / m_lat, c_lon - 1500 / m_lon, c_lon + 1500 / m_lon, 50.0,
+                     Terrain().elevation, geoid)
     ev1, ev2 = cfg["events"]()
     res, _ = pipeline.run_search(sp, ev1, ev2, traces, grid, harmonics=cfg["harmonics"], interp=o["interp"], progress=False)
     assert len(res), "no candidate survived the filters"

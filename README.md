@@ -414,7 +414,7 @@ the risk went from high to medium after the first pass and to low after the seco
 | `test_real_day` | one real day of ADS-B over a region | `DOPPLERTRACK_DAY_TRACES=traces.npz` |
 | `test_oyster_bay`, `test_real_recordings` | the two recordings with known answers, and their days of ADS-B | `DOPPLERTRACK_OYSTER_BAY=dir`, `DOPPLERTRACK_SWFL=dir` |
 
-`test_real_recordings` searches +-3 km around each known answer under four option sets
+`test_real_recordings` searches a 50 m grid over +-1.5 km around each known answer under four option sets
 (the old baseline, the geoid, Hermite, Hermite with baro calibration) and asserts the right
 flight pair stays first and within 500 m; with `DOPPLERTRACK_REPORT=report.csv` it writes
 the peak distance, score and margin for each, which is the evidence for changing a default.
@@ -432,6 +432,29 @@ DOPPLERTRACK_OYSTER_BAY=data/oyster_bay DOPPLERTRACK_SWFL=data/swfl \
   DOPPLERTRACK_DAY_TRACES=data/oyster_bay/traces_ny.npz DOPPLERTRACK_REPORT=report.csv \
   uv run pytest -s tests/test_real_recordings.py tests/test_real_day.py tests/test_oyster_bay.py
 ```
+
+### First real-data results (Oyster Bay, 2026-11-05)
+
+Recording and that day's ADS-B (1,016 non-jet flights) supplied by the repository owner.
+
+| check | result |
+|---|---|
+| Hermite vs linear, every other report held out, whole day (730,342 reports) | median 5.9 -> 4.2 m, 90th percentile 15.0 -> 11.1 m |
+| Baro calibration across aircraft (174 aircraft's GNSS altitude hidden) | median error 68.6 -> 11.4 m, 90th percentile 282 -> 63 m |
+| Share of airborne reports with GNSS altitude that day | 99 %: `--calibrate-baro` barely matters here |
+| Right pair first, peak within 500 m, all four option sets | yes |
+| Peak distance from the truth, 10 m grid: baseline / + geoid / + Hermite | 36 m / 72 m / 43 m |
+
+So the flight-data side improves measurably, but on this one recording none of the options
+moves the answer by more than the flatness of the score near its peak (each option's points
+within 1 % of the peak spread over about 50 m). What dominates instead is the speed of sound:
+at the true point the score falls from 28.4 at 10 C to 20.1 at 30 C, against about 1 point
+for the 32 m datum shift, and temperature and observer height trade off (at 10 C the geoid
+scores higher than the old datum, at 15 C lower). The recording prefers 337-340 m/s, which is
+colder than a September afternoon on Long Island is likely to have been; wind against the
+sound would do that, and the day's real weather (`--weather`) is the next thing to check.
+Until then the geoid stays on because the physics says so (the QNH check above), not because
+this recording shows it.
 
 ## Changes from the method in the video
 
