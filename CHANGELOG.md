@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Traces keep what each report says (roadmap D4): the altitude's source (geometric,
+  barometric, none, honouring readsb's flag 8 for a geometric altitude in slot 3), the
+  pressure altitude, the position source (ADS-B, ADS-R, TIS-B, MLAT, ADS-C), the row flags,
+  track and vertical rate. `alt` is unchanged. Trace files gain six rows; older files still
+  load. A test shows on the sample trace why the source matters: geometric altitude minus
+  QNH-corrected pressure altitude is -32 m, the EGM96 geoid there (-34 m), not zero.
+
 - `dopplertrack.verdict`: the winner of a search is judged against the wrong
   pairs the same search scored (an exponential upper tail fitted on the best
   wrong pairs; p is the chance a wrong winner would lead the next wrong pair by

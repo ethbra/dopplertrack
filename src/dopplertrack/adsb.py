@@ -8,7 +8,7 @@ import json
 import os
 import zlib
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -60,9 +60,16 @@ class Trace:
     t: np.ndarray        # unix seconds
     lat: np.ndarray
     lon: np.ndarray
-    alt: np.ndarray      # metres MSL (geometric when available, else barometric)
+    alt: np.ndarray      # metres: geometric (WGS-84 ellipsoid) when available, else barometric (pressure altitude)
     gs: np.ndarray       # m/s (nan if missing)
     on_ground: np.ndarray
+    # what each report said, beyond the values above (None for traces saved before these existed)
+    alt_src: np.ndarray | None = field(default=None, repr=False)   # ALT_SOURCES index of alt
+    alt_baro: np.ndarray | None = field(default=None, repr=False)  # pressure altitude, m (nan if none)
+    pos_src: np.ndarray | None = field(default=None, repr=False)   # POS_SOURCES index of the position
+    flags: np.ndarray | None = field(default=None, repr=False)     # readsb row flags (2: new leg after a gap, 8: slot 3 is geometric)
+    track: np.ndarray | None = field(default=None, repr=False)     # true track over ground, deg (nan if missing)
+    vrate: np.ndarray | None = field(default=None, repr=False)     # vertical rate, m/s (nan if missing)
 
     def __len__(self):
         return len(self.t)
@@ -90,6 +97,21 @@ class Trace:
         return tq, lla_to_enu(la, lo, al, lat0, lon0)
 
 
+ALT_SOURCES = ("none", "geometric", "barometric")
+POS_SOURCES = ("unknown", "adsb", "adsr", "tisb", "mlat", "adsc", "other")
+FLAG_GEOMETRIC_ALT = 8      # readsb: the altitude in slot 3 is geometric, not barometric
+
+
+def _pos_source(kind) -> int:
+    """readsb's slot-9 source ("adsb_icao", "mlat", "tisb_trackfile", ...) as a POS_SOURCES index."""
+    if not isinstance(kind, str):
+        return 0
+    for i, name in enumerate(POS_SOURCES[1:], 1):
+        if kind.startswith(name):
+            return i
+    return POS_SOURCES.index("other")
+
+
 def parse_trace_file(path: str | Path) -> Trace | None:
     return parse_trace_bytes(Path(path).read_bytes(), Path(path).stem.split("_")[-1])
 
@@ -103,27 +125,37 @@ def parse_trace_bytes(raw: bytes, fallback_icao: str = "") -> Trace | None:
         return None
     base = float(d.get("timestamp", 0.0))
     rows = d.get("trace") or []
+    num = (int, float)
     t, lat, lon, alt, gs, grd = [], [], [], [], [], []
+    asrc, baro, psrc, flg, trk, vr = [], [], [], [], [], []
     for r in rows:
         if r[1] is None or r[2] is None:
             continue
         a = r[3]
         on_ground = a == "ground"
         geom = r[10] if len(r) > 10 else None
-        if isinstance(geom, (int, float)):
-            am = geom * FT
-        elif isinstance(a, (int, float)):
-            am = a * FT
+        f = r[6] if len(r) > 6 and isinstance(r[6], int) else 0
+        a_is_geom = bool(f & FLAG_GEOMETRIC_ALT)
+        if isinstance(geom, num):
+            am, src = geom * FT, 1
+        elif isinstance(a, num):
+            am, src = a * FT, 1 if a_is_geom else 2
         elif on_ground:
-            am = np.nan
+            am, src = np.nan, 0
         else:
             continue
         t.append(base + r[0]); lat.append(r[1]); lon.append(r[2]); alt.append(am)
-        gs.append(r[4] * KT if isinstance(r[4], (int, float)) else np.nan); grd.append(on_ground)
+        gs.append(r[4] * KT if isinstance(r[4], num) else np.nan); grd.append(on_ground)
+        asrc.append(src); baro.append(a * FT if isinstance(a, num) and not a_is_geom else np.nan)
+        psrc.append(_pos_source(r[9] if len(r) > 9 else None)); flg.append(f)
+        trk.append(r[5] if len(r) > 5 and isinstance(r[5], num) else np.nan)
+        vr.append(r[7] * FT / 60.0 if len(r) > 7 and isinstance(r[7], num) else np.nan)
     if not t:
         return None
     return Trace(d.get("icao", fallback_icao), d.get("r"), d.get("t"), d.get("desc"),
-                 np.array(t), np.array(lat), np.array(lon), np.array(alt), np.array(gs), np.array(grd))
+                 np.array(t), np.array(lat), np.array(lon), np.array(alt), np.array(gs), np.array(grd),
+                 np.array(asrc, np.int8), np.array(baro, float), np.array(psrc, np.int8), np.array(flg, np.int32),
+                 np.array(trk, float), np.array(vr, float))
 
 
 def _scan_one(args):
@@ -158,10 +190,20 @@ def in_bbox(tr: Trace, bbox) -> bool:
     return bool(((tr.lat >= lat0) & (tr.lat <= lat1) & (tr.lon >= lon0) & (tr.lon <= lon1)).any())
 
 
+_EXTRA = ("alt_src", "alt_baro", "pos_src", "flags", "track", "vrate")
+
+
 def save_traces(traces: list[Trace], path: str | Path):
+    """One (6 or 12, N) array per trace: t, lat, lon, alt, gs, on_ground, then _EXTRA when the
+    trace has them. load_traces reads either."""
+    def rows(t):
+        base = [t.t, t.lat, t.lon, t.alt, t.gs, t.on_ground.astype(float)]
+        if t.alt_src is None:
+            return np.stack(base)
+        return np.stack(base + [np.asarray(getattr(t, k), float) for k in _EXTRA])
     np.savez_compressed(path, n=len(traces),
                         meta=np.array([json.dumps([t.icao, t.reg, t.typ, t.desc]) for t in traces]),
-                        **{f"a{i}": np.stack([t.t, t.lat, t.lon, t.alt, t.gs, t.on_ground.astype(float)]) for i, t in enumerate(traces)})
+                        **{f"a{i}": rows(t) for i, t in enumerate(traces)})
 
 
 def load_traces(path: str | Path) -> list[Trace]:
@@ -171,5 +213,8 @@ def load_traces(path: str | Path) -> list[Trace]:
     for i in range(int(z["n"])):
         icao, reg, typ, desc = json.loads(str(meta[i]))
         a = z[f"a{i}"]
-        out.append(Trace(icao, reg, typ, desc, a[0], a[1], a[2], a[3], a[4], a[5].astype(bool)))
+        extra = ()
+        if a.shape[0] >= 12:
+            extra = (a[6].astype(np.int8), a[7], a[8].astype(np.int8), a[9].astype(np.int32), a[10], a[11])
+        out.append(Trace(icao, reg, typ, desc, a[0], a[1], a[2], a[3], a[4], a[5].astype(bool), *extra))
     return out
