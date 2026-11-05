@@ -34,14 +34,11 @@ which worked from the full transcript and three screenshots;
 
 ### Added in this round, and what is and is not validated
 
-One of these changes the default: the altitude datum (below), a correction rather than a
-model choice; `--no-geoid` restores the old behaviour, which is how the Results above were
-made. Everything else is opt-in. The flight-data side is checked on real ADS-B
-(`tests/test_real_adsb.py`, offline, and `tests/test_real_day.py` for a whole day); none of
-it has yet been run on the two real recordings, so the options that change the answer are
-not defaults until `tests/test_real_recordings.py` (see Validation below) says they help.
+Every addition is opt-in; with no new flags the results are upstream's. The flight-data side
+is checked on real ADS-B (`tests/test_real_adsb.py`, offline; `tests/test_real_day.py` for a
+whole day) and the location side on both recordings (`tests/test_real_recordings.py`).
 
-- **Altitude datum (default on).** ADS-B geometric altitude is GNSS height above the WGS-84
+- **Altitude datum** (`--geoid`). ADS-B geometric altitude is GNSS height above the WGS-84
   ellipsoid; terrain tiles give height above mean sea level. The two differ by the geoid
   undulation (about -33 m around New York, -28 m in south-west Florida), so every observer
   sat that far too high relative to the aircraft. The sample trace in `tests/data` shows it

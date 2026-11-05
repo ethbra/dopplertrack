@@ -1,6 +1,9 @@
 """The video's countermeasure claims, checked on the synthetic recording, and the audit and
 scrub tools built on them."""
+import os
+
 import numpy as np
+import pytest
 import scipy.signal as ss
 
 from dopplertrack import audio, doppler, privacy, search, tracks
@@ -10,6 +13,11 @@ from conftest import C, T0, LAT0, LON0, synth_trace, tone_audio
 
 
 F0 = (120.0, 130.0)        # the synthetic flights' rest frequencies
+
+
+# the two slow checks (about 2.5 min together) run only with DOPPLERTRACK_SLOW=1, keeping the
+# default suite near upstream's two-minute budget
+slow = pytest.mark.skipif(not os.environ.get("DOPPLERTRACK_SLOW"), reason="set DOPPLERTRACK_SLOW=1 to run")
 
 
 def _contrast(sp, ev, seg, f0):
@@ -30,6 +38,7 @@ def test_high_pass_and_boost_do_not_hide_the_curve(synthetic):
     assert _contrast(sp, ev, s["segs"][0], F0[0]) > 0.7 * _contrast(s["sp"], s["ev1"], s["segs"][0], F0[0])
 
 
+@slow
 def test_phone_band_keeps_the_curve_in_the_harmonics():
     """300-3400 Hz removes the 120 Hz fundamental; its 4th harmonic traces the same curve."""
     sr = 8000
@@ -75,6 +84,7 @@ def test_scrub_mute_and_cut(synthetic):
     assert abs(len(c) - (len(s["x"]) - (ev.t_end - ev.t_start + 20) * sr)) <= 2
 
 
+@slow
 def test_audit_rates_the_synthetic_recording_high_and_noise_low(synthetic):
     s = synthetic
     r = privacy.audit(s["sp"], 90, 180, c=C, top=2)

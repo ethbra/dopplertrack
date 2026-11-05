@@ -12,8 +12,8 @@
   `refine` prints the peak's spread.
 
 - Altitude datum: observers (and baro-only aircraft at `fetch`) are put on the WGS-84
-  ellipsoid that ADS-B geometric altitude uses, with the EGM96 geoid. On by default in the
-  CLI; `--no-geoid` restores the old datum. The sample trace's GNSS altitude minus its
+  ellipsoid that ADS-B geometric altitude uses, with the EGM96 geoid (`--geoid`, off by
+  default so the saved results are unchanged). The sample trace's GNSS altitude minus its
   QNH-corrected pressure altitude is -32.2 m where EGM96 gives -33.6 m.
 
 - Atmosphere: `c` can be a `doppler.Atmosphere` (sound speed by height); each ray uses the

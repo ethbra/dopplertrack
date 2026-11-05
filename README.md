@@ -117,9 +117,9 @@ uv run dopplertrack scrub recording.mp4 clean.wav --events leaks.json --band 60 
 ```
 
 Heights: ADS-B geometric altitude is height above the WGS-84 ellipsoid and terrain is height
-above sea level, so `search`, `refine` and `fetch` put observers (and baro-only aircraft) on
-the ellipsoid with the EGM96 geoid (about 33 m around New York). `--no-geoid` restores the
-datum the published results used.
+above sea level. `--geoid` on `fetch`, `search` and `refine` puts observers (and baro-only
+aircraft) on the ellipsoid with the EGM96 geoid (about 33 m around New York); it is off by
+default, as the saved results were made.
 
 ## How the search works
 

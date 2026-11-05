@@ -55,12 +55,7 @@ def parse_utc(s: str) -> float:
     try:
         return float(s)
     except ValueError:
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
-
-
+        return datetime.fromisoformat(s).astimezone(timezone.utc).timestamp()
 
 
 def _add_medium(sp, weather=True):
@@ -78,20 +73,21 @@ def _add_medium(sp, weather=True):
 
 
 def _add_geoid(sp):
-    sp.add_argument("--no-geoid", action="store_true",
-                    help="treat terrain height (MSL) as ellipsoidal height, as results before the geoid fix did")
+    sp.add_argument("--geoid", action="store_true",
+                    help="put observers (and, at fetch, baro-only aircraft) on the ellipsoid ADS-B geometric altitude uses, "
+                         "with the EGM96 geoid; off by default, as the saved results were made")
 
 
 def _geoid(a):
-    """EGM96 undulation function, or None with --no-geoid. A failed download is fatal: a
-    silent fallback would move every observer ~30 m without saying so."""
-    if getattr(a, "no_geoid", False):
+    """EGM96 undulation function with --geoid, else None. A failed download is fatal: a
+    silent fallback would leave every observer ~30 m off without saying so."""
+    if not getattr(a, "geoid", False):
         return None
     from .geoid import Geoid
     try:
         return Geoid().undulation
     except Exception as e:
-        raise SystemExit(f"could not load the EGM96 geoid grid ({e}); pass --no-geoid to run without it")
+        raise SystemExit(f"could not load the EGM96 geoid grid ({e}); run without --geoid")
 
 
 
@@ -292,7 +288,7 @@ def main(argv=None):
         points = None
         if a.point:
             la, lo = np.array([a.point[0]]), np.array([a.point[1]])
-            points = (la, lo, np.maximum(elev(la, lo), 0.0) if elev else np.zeros(1))
+            points = (la, lo, elev(la, lo) if elev else np.zeros(1))
         geoid = _geoid(a)
         t_utc = parse_utc(a.utc) if a.utc else None
         mlat, mlon = (a.point if a.point else ((a.bbox[0] + a.bbox[1]) / 2, (a.bbox[2] + a.bbox[3]) / 2) if a.bbox else (idx.lat0, idx.lon0))

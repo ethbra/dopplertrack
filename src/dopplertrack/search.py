@@ -317,6 +317,8 @@ class LensParams:
     def fingerprint(self) -> dict:
         out = {}
         for k, v in self.__dict__.items():
+            if k == "wind" and v is None:        # absent, so caches made before the field existed stay valid
+                continue
             if k == "points":
                 out[k] = None if v is None else [float(x) for x in np.asarray(v[0]).ravel()[:50]]
             else:
