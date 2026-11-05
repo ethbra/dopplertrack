@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- `audit` and `scrub`, for checking and cleaning a recording before publishing it (the
+  video's last part). `audit` runs `detect` and compares each flyover with the best score
+  `detect` finds in the time-reversed spectrogram: a Doppler curve only falls, so reversed
+  it does not fit, while noise, bursts and hum look the same either way. Two flyovers above
+  that level is "high" (enough for a search with no clock), one is "medium". `scrub`
+  replaces the short-time spectrum along each flyover's harmonics with noise at that bin's
+  level (`fill`; zeroing would leave a dark curve of the same shape), or mutes or cuts the
+  window; `--band` re-audits the output and scrubs what is left. Tests check the video's
+  claims on synthetic audio: a high-pass filter plus a boost does not hide the curve, and a
+  300-3400 Hz phone band keeps it in the harmonics.
+
 - `dopplertrack.verdict`: the winner of a search is judged against the wrong
   pairs the same search scored (an exponential upper tail fitted on the best
   wrong pairs; p is the chance a wrong winner would lead the next wrong pair by

@@ -1,4 +1,4 @@
-"""dopplertrack command line: spectrogram, detect, fit, fetch, search, refine."""
+"""dopplertrack command line: spectrogram, detect, fit, fetch, search, refine, audit, scrub."""
 from __future__ import annotations
 
 import argparse
@@ -28,6 +28,16 @@ SCORE = dict(choices=("brightness", "ridge"), default="brightness",
 def load_event(path) -> EventFit:
     with open(path) as fh:
         return EventFit(**json.load(fh))
+
+
+def load_events(paths) -> list[EventFit]:
+    """Events from JSON files holding one event (fit) or a list of them (detect, audit)."""
+    out = []
+    for p in paths:
+        with open(p) as fh:
+            d = json.load(fh)
+        out.extend(EventFit(**e) for e in (d if isinstance(d, list) else [d]))
+    return out
 
 
 def parse_utc(s: str) -> float:
@@ -99,6 +109,19 @@ def main(argv=None):
     rf.add_argument("--extra", nargs="*", default=[], metavar="EV_JSON", help="further events (from detect or fit) to score locked to the same clock")
     rf.add_argument("--extra-harmonics", nargs="*", type=int, default=[])
     rf.add_argument("--no-dem", action="store_true"); rf.add_argument("--score", **SCORE)
+
+    au = sub.add_parser("audit", help="does a recording leak its location? detected flyovers against the chance level")
+    au.add_argument("spec"); au.add_argument("--band", nargs=2, type=float, default=(60.0, 300.0), metavar=("FLO", "FHI"))
+    au.add_argument("--harmonics", type=int, default=1); au.add_argument("--top", type=int, default=20)
+    au.add_argument("--window", type=float, default=240.0); au.add_argument("--out", help="write the flyovers above chance as a JSON list (scrub reads it)")
+
+    sc = sub.add_parser("scrub", help="remove the Doppler tones of given flyovers from an audio or video file (writes WAV)")
+    sc.add_argument("audio"); sc.add_argument("out"); sc.add_argument("--events", nargs="+", required=True, help="event JSON (fit, detect or audit)")
+    sc.add_argument("--mode", choices=("fill", "mute", "cut"), default="fill")
+    sc.add_argument("--sr", type=int, default=16000); sc.add_argument("--width", type=float, default=0.04, help="half-width of the removed band, fraction of frequency")
+    sc.add_argument("--pad", type=float, default=30.0, help="seconds beyond each event window"); sc.add_argument("--fmax", type=float, default=1500.0)
+    sc.add_argument("--band", nargs=2, type=float, metavar=("FLO", "FHI"), help="after scrubbing, audit the result in this band and scrub what is still above chance")
+    sc.add_argument("--passes", type=int, default=2, help="with --band: audit-and-scrub rounds after the first")
 
     a = ap.parse_args(argv)
     if a.cmd == "spectrogram":
@@ -181,6 +204,51 @@ def main(argv=None):
         b = fine.iloc[0]
         print(f"peak score {b.score:.2f} at {b.lat:.6f}, {b.lon:.6f}" + (f"; extra flights {fine.attrs['extra_icao']}" if extra else ""))
         print(fine.head(10).to_string())
+    elif a.cmd == "audit":
+        _audit(a)
+    elif a.cmd == "scrub":
+        _scrub(a)
+
+
+def _audit(a):
+    from .privacy import audit
+    r = audit(Spectrogram.load(a.spec), a.band[0], a.band[1], harmonics=a.harmonics, top=a.top, window_s=a.window,
+              progress=lambda k, n: print(f"\r  window {k}/{n}", end="", flush=True))
+    print()
+    print(f"chance level (best score in the time-reversed recording): {r['chance']:.2f}")
+    print(f"{'rank':>4} {'t_cpa s':>9} {'f0 Hz':>7} {'v m/s':>6} {'d m':>7} {'score':>6}")
+    for i, e in enumerate(r["events"]):
+        print(f"{i + 1:>4} {e.t_cpa:>9.1f} {e.f0:>7.1f} {e.v:>6.0f} {e.d:>7.0f} {e.score:>6.2f}" + ("  above chance" if e.score > r["chance"] else ""))
+    print({"high": "risk: high, two or more flyovers above chance; with the time between them a search needs no clock",
+           "medium": "risk: medium, one flyover above chance; enough with a known recording time",
+           "low": "risk: low, no flyover above chance"}[r["risk"]])
+    if a.out:
+        with open(a.out, "w") as fh:
+            json.dump([e.to_dict() for e in r["credible"]], fh, indent=1)
+
+
+def _scrub(a):
+    from .audio import compute_spectrogram, load_audio
+    from .privacy import audit, scrub_audio, write_wav
+    evs = load_events(a.events)
+    x, sr = load_audio(a.audio, a.sr)
+    y = scrub_audio(x, sr, evs, mode=a.mode, width=a.width, pad_s=a.pad, fmax=a.fmax)
+    print(f"{len(evs)} events scrubbed ({a.mode})")
+    if a.band and a.mode == "fill":
+        # a detected fit can be far enough off the real tone that the mask misses it; the audit
+        # of the result fits what is left afresh, so scrub that too
+        import scipy.signal as ss
+        from math import gcd
+        for k in range(a.passes):
+            g = gcd(sr, 4000)
+            y4 = ss.resample_poly(y, 4000 // g, sr // g).astype(np.float32) if sr != 4000 else y
+            r = audit(compute_spectrogram(y4, 4000), a.band[0], a.band[1], top=10)
+            print(f"audit after pass {k + 1}: risk {r['risk']}, {len(r['credible'])} above chance {r['chance']:.2f}")
+            if not r["credible"]:
+                break
+            y = scrub_audio(y, sr, r["credible"], mode="fill", width=a.width, pad_s=a.pad, fmax=a.fmax, seed=k + 1)
+    write_wav(a.out, y, sr)
+    print(f"wrote {a.out}: {len(y) / sr:.1f} s")
 
 
 if __name__ == "__main__":

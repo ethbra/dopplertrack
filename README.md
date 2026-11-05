@@ -93,6 +93,8 @@ uv run dopplertrack refine rec.npz results.csv --events ev1.json ev2.json --day 
   reruns only the scoring. `--extra` rescores the best pairs with further
   flyovers.
 - `refine` lays a 50 m grid around one result, optionally with more events.
+- `audit` says whether a recording leaks its location (flyovers above a chance level from the
+  time-reversed recording); `scrub` removes those flyovers' tones from the audio.
 
 ## How the search works
 
