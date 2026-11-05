@@ -487,6 +487,32 @@ have not improved a location on these two recordings, so they stay opt-in. Two r
 with known answers are too few to settle more than that; lateral, low passes (which constrain
 the location) are what the next validation recordings need.
 
+### Livermore: 40 single flyovers (`benchmarks/livermore.py`)
+
+A public dataset (Pathak 2026, [Zenodo 23424278](https://zenodo.org/records/23424278),
+CC BY 4.0): 40 smartphone recordings of aircraft over Livermore, CA, May 2026, each with the
+author's traced frequency curve (UTC timestamps), the ADS-B track, and the true horizontal,
+vertical and slant distance from the recorder to the track. The recorder's position is not
+published and it moved between sessions, so each configuration locates the recorder from one
+traced curve (free clock shift and rest frequency) and is scored by the slant distance it
+recovers. The measurement is the author's, so this tests the propagation model alone.
+
+| configuration | median slant error | mean | better than old (of 40) | paired p |
+|---|---|---|---|---|
+| old: 15 C, linear, old datum | 84 m | 136 m | n/a | n/a |
+| geoid | 83 m | 132 m | 18 | 0.61 |
+| geoid + Hermite | 81 m | 136 m | 21 | 0.25 |
+| + the afternoon's surface temperature | 69 m | 122 m | 24 | 0.44 |
+| + temperature profile | 56 m | 134 m | 22 | 0.37 |
+| + profile + wind | 63 m | 138 m | 22 | 0.43 |
+
+The profile lowers the median by a third, but no configuration is distinguishable from the
+old model (Wilcoxon signed-rank, every p > 0.2). The traced curves sit about 3.3 Hz (1 %) from
+every model's best fit, far above the fractions of a hertz the changes make, so on this data
+the measurement noise decides; the aircraft here are also low (median 1.3 km), where the
+profile differs little from the surface. Real-data evidence so far, over 42 flyovers on three
+sites: the changes fix the physics they target and do not yet show in a location.
+
 ## Changes from the method in the video
 
 The physics and the search strategy are the author's. What differs:
