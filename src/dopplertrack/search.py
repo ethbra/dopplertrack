@@ -22,7 +22,10 @@ class Grid:
     lon0: float
 
     @classmethod
-    def make(cls, lat_min, lat_max, lon_min, lon_max, spacing_m, elevation_fn=None):
+    def make(cls, lat_min, lat_max, lon_min, lon_max, spacing_m, elevation_fn=None, geoid_fn=None):
+        """elevation_fn gives terrain height above mean sea level (clipped at 0: water);
+        geoid_fn the geoid undulation, so the observer sits at ellipsoidal height
+        elev + N, the datum ADS-B geometric altitude uses. elev keeps the MSL value."""
         lat0, lon0 = (lat_min + lat_max) / 2, (lon_min + lon_max) / 2
         dlat = spacing_m / 111320.0
         dlon = spacing_m / (111320.0 * np.cos(np.radians(lat0)))
@@ -30,13 +33,15 @@ class Grid:
         la, lo = la.ravel(), lo.ravel()
         el = elevation_fn(la, lo) if elevation_fn else np.zeros_like(la)
         el = np.maximum(el, 0.0)
-        return cls(la, lo, el, lla_to_enu(la, lo, el, lat0, lon0), lat0, lon0)
+        h = el + (geoid_fn(la, lo) if geoid_fn else 0.0)
+        return cls(la, lo, el, lla_to_enu(la, lo, h, lat0, lon0), lat0, lon0)
 
     @classmethod
-    def points(cls, lat, lon, elev, lat0=None, lon0=None):
+    def points(cls, lat, lon, elev, lat0=None, lon0=None, geoid_fn=None):
         lat = np.atleast_1d(np.asarray(lat, float)); lon = np.atleast_1d(np.asarray(lon, float)); elev = np.atleast_1d(np.asarray(elev, float))
         lat0 = float(lat.mean()) if lat0 is None else lat0; lon0 = float(lon.mean()) if lon0 is None else lon0
-        return cls(lat, lon, elev, lla_to_enu(lat, lon, elev, lat0, lon0), lat0, lon0)
+        h = elev + (geoid_fn(lat, lon) if geoid_fn else 0.0)
+        return cls(lat, lon, elev, lla_to_enu(lat, lon, h, lat0, lon0), lat0, lon0)
 
     def __len__(self):
         return len(self.lat)

@@ -63,13 +63,36 @@ def _add_traces(sp):
                     help="trajectory between ADS-B reports: linear (as the results were made) or hermite (uses each report's speed and track, so turns curve)")
     sp.add_argument("--calibrate-baro", action="store_true",
                     help="move baro-only altitudes onto the geometric datum using aircraft that report both")
+    _add_geoid(sp)
 
 
-def _traces(a):
+def _add_geoid(sp):
+    sp.add_argument("--no-geoid", action="store_true",
+                    help="treat terrain height (MSL) as ellipsoidal height, as results before the geoid fix did")
+
+
+def _geoid(a):
+    """EGM96 undulation function, or None with --no-geoid. A failed download is fatal: a
+    silent fallback would move every observer ~30 m without saying so."""
+    if getattr(a, "no_geoid", False):
+        return None
+    from .geoid import Geoid
+    try:
+        return Geoid().undulation
+    except Exception as e:
+        raise SystemExit(f"could not load the EGM96 geoid grid ({e}); pass --no-geoid to run without it")
+
+
+def _traces(a, geoid=None):
     traces = load_many(a.traces)
     if getattr(a, "calibrate_baro", False):
         st = calibrate_baro(traces)
         pipeline.log(f"baro calibration: {st}")
+    elif geoid is not None:
+        from .adsb import baro_to_ellipsoid
+        n = baro_to_ellipsoid(traces, geoid)
+        if n:
+            pipeline.log(f"{n} baro-only reports moved to the ellipsoid by the geoid (try --calibrate-baro)")
     return traces
 
 
@@ -222,6 +245,7 @@ def main(argv=None):
     pl.add_argument("--truth", nargs=2, type=float, metavar=("LAT", "LON")); pl.add_argument("--top", type=int, default=30)
     pl.add_argument("--interp", choices=INTERP_METHODS, default="linear")
     pl.add_argument("--temp", type=float, metavar="C")
+    _add_geoid(pl)
 
     a = ap.parse_args(argv)
     if a.cmd == "spectrogram":
@@ -264,13 +288,14 @@ def main(argv=None):
     elif a.cmd == "search":
         sp = Spectrogram.load(a.spec)
         ev1, ev2 = (load_event(p) for p in a.events)
-        traces = _traces(a)
+        geoid = _geoid(a)
+        traces = _traces(a, geoid)
         elev = None if a.no_dem else Terrain().elevation
         if a.point:
-            el = elev(np.array([a.point[0]]), np.array([a.point[1]])) if elev else np.zeros(1)
-            grid = Grid.points([a.point[0]], [a.point[1]], el)
+            el = np.maximum(elev(np.array([a.point[0]]), np.array([a.point[1]])), 0.0) if elev else np.zeros(1)
+            grid = Grid.points([a.point[0]], [a.point[1]], el, geoid_fn=geoid)
         elif a.bbox:
-            grid = Grid.make(*a.bbox, a.spacing, elev)
+            grid = Grid.make(*a.bbox, a.spacing, elev, geoid)
         else:
             ap.error("search needs --bbox or --point")
         c, wind = _medium(a, grid.lat0, grid.lon0, _median_time(traces))
@@ -296,14 +321,16 @@ def main(argv=None):
         res = pd.read_csv(a.results)
         best = res.sort_values("score", ascending=False).drop_duplicates(["icao1", "icao2"]).reset_index(drop=True)
         row = best.iloc[a.rank - 1]
-        traces = _traces(a)
+        geoid = _geoid(a)
+        traces = _traces(a, geoid)
         elev = None if a.no_dem else Terrain().elevation
         segs = pipeline.segments_for_search(traces, tuple(a.bbox), float(row.lat0), float(row.lon0), interp=a.interp)
         row = pipeline.relocate_row(row, segs, ev2.t_cpa - ev1.t_cpa)
         print(f"refining rank {a.rank}: {row.icao1}/{row.icao2} at {row.lat:.5f}, {row.lon:.5f} (score {row.score:.2f})")
         c, wind = _medium(a, float(row.lat), float(row.lon), float(row.t_heard1))
         fine = pipeline.refine(sp, ev1, ev2, segs, row, spacing_m=a.spacing, half_m=a.half, harmonics=tuple(a.harmonics),
-                               elevation=elev, extra=extra, extra_harmonics=xh, score_mode=a.score, c=c, wind=wind)
+                               elevation=elev, extra=extra, extra_harmonics=xh, score_mode=a.score, c=c, wind=wind,
+                               geoid=geoid)
         fine.to_csv(a.out, index=False)
         b = fine.iloc[0]
         print(f"peak score {b.score:.2f} at {b.lat:.6f}, {b.lon:.6f}" + (f"; extra flights {fine.attrs['extra_icao']}" if extra else ""))
@@ -313,10 +340,11 @@ def main(argv=None):
     elif a.cmd == "search-single":
         sp = Spectrogram.load(a.spec)
         ev = load_event(a.event)
-        traces = _traces(a)
+        geoid = _geoid(a)
+        traces = _traces(a, geoid)
         t_unix = parse_utc(a.utc)
         elev = None if a.no_dem else Terrain().elevation
-        grid = Grid.make(*a.bbox, a.spacing, elev)
+        grid = Grid.make(*a.bbox, a.spacing, elev, geoid)
         c, wind = _medium(a, grid.lat0, grid.lon0, t_unix)
         res, segs = pipeline.run_single_search(sp, ev, traces, grid, t_unix, tol_s=a.tol, harmonics=a.harmonics,
                                                v_tol=a.v_tol, d_tol=tuple(a.d_tol), score_mode=a.score, c=c, wind=wind,
@@ -341,7 +369,8 @@ def main(argv=None):
 def _explain(a):
     from .doppler import curve_from_trajectory, explain
     from .geo import lla_to_enu
-    traces = [t for t in _traces(a) if t.icao == a.icao]
+    geoid = _geoid(a)
+    traces = [t for t in _traces(a, geoid) if t.icao == a.icao]
     if not traces:
         raise SystemExit(f"{a.icao} is not in these traces")
     t_r = parse_utc(a.utc)
@@ -353,7 +382,7 @@ def _explain(a):
     if not segs:
         raise SystemExit(f"{a.icao} has no airborne segment around that time")
     seg = segs[0]
-    obs = lla_to_enu(lat, lon, el, lat, lon)
+    obs = lla_to_enu(lat, lon, el + (float(geoid(np.array([lat]), np.array([lon]))[0]) if geoid else 0.0), lat, lon)
     d = explain(t_r, seg.t, seg.enu, obs, a.f0, c=c, wind=wind)
     p, v = d["pos"], d["vel"]
     print(f"Building the Doppler curve, step by step ({a.icao}, observer {lat:.6f}, {lon:.6f}, {el:.0f} m)")
@@ -495,9 +524,16 @@ def _plot(a, ap):
         res = pd.read_csv(a.results)
         best = res.sort_values("score", ascending=False).drop_duplicates(["icao1", "icao2"]).reset_index(drop=True)
         row = best.iloc[a.rank - 1]
-        segs = pipeline.segments_for_search(load_many(a.traces), tuple(a.bbox), float(row.lat0), float(row.lon0), interp=a.interp)
+        geoid = _geoid(a)
+        traces = load_many(a.traces)
+        if geoid is not None:
+            from .adsb import baro_to_ellipsoid
+            baro_to_ellipsoid(traces, geoid)
+        segs = pipeline.segments_for_search(traces, tuple(a.bbox), float(row.lat0), float(row.lon0), interp=a.interp)
         row = pipeline.relocate_row(row, segs, ev2.t_cpa - ev1.t_cpa)
-        el = float(Terrain().elevation(np.array([row.lat]), np.array([row.lon]))[0])
+        el = max(float(Terrain().elevation(np.array([row.lat]), np.array([row.lon]))[0]), 0.0)
+        if geoid is not None:
+            el += float(geoid(np.array([row.lat]), np.array([row.lon]))[0])
         obs = lla_to_enu(row.lat, row.lon, el, row.lat0, row.lon0)
         off = ev1.t_cpa - float(row.t_heard1) + float(row["shift"])
         h = list(a.harmonics) + [a.harmonics[-1]] * (2 - len(a.harmonics))

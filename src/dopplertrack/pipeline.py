@@ -189,8 +189,10 @@ def pick_flight(sp: Spectrogram, ev: EventFit, segs: list[Segment], obs_enu, t0_
 
 def refine(sp, ev1, ev2, segs, res_row, spacing_m=50.0, half_m=400.0, harmonics=(1, 1), elevation=None, c=None,
            extra: list[EventFit] | None = None, extra_harmonics: list[int] | None = None,
-           score_mode="brightness", wind=None):
+           score_mode="brightness", wind=None, geoid=None):
     """Fine grid around one result row for one flight pair.
+
+    elevation / geoid: terrain height (MSL) and geoid undulation functions, as Grid.make takes.
 
     extra: further measured events (beyond the two the search used). For each, the flight is
     chosen once at the candidate point (pick_flight), then its modelled curve is scored at
@@ -205,13 +207,15 @@ def refine(sp, ev1, ev2, segs, res_row, spacing_m=50.0, half_m=400.0, harmonics=
     extra = list(extra or []); extra_harmonics = list(extra_harmonics or [1] * len(extra))
     lat, lon = float(res_row.lat), float(res_row.lon)
     dlat = half_m / 111320.0; dlon = half_m / (111320.0 * np.cos(np.radians(lat)))
-    g = Grid.make(lat - dlat, lat + dlat, lon - dlon, lon + dlon, spacing_m, elevation)
+    g = Grid.make(lat - dlat, lat + dlat, lon - dlon, lon + dlon, spacing_m, elevation, geoid)
     # re-express grid in the segments' ENU frame (segments were built on the search grid origin)
     seg1, seg2 = segs[int(res_row.seg1)], segs[int(res_row.seg2)]
     w1 = EventWindow.from_fit(sp, ev1, harmonics[0], mode=score_mode)
     w2 = EventWindow.from_fit(sp, ev2, harmonics[1], mode=score_mode)
     # choose the flight for each extra event at the candidate point itself
-    el0 = float(elevation(np.array([lat]), np.array([lon]))[0]) if elevation else 0.0
+    el0 = max(float(elevation(np.array([lat]), np.array([lon]))[0]), 0.0) if elevation else 0.0
+    if geoid:
+        el0 += float(geoid(np.array([lat]), np.array([lon]))[0])
     obs0 = lla_to_enu(lat, lon, el0, res_row.lat0, res_row.lon0)
     t0_map0 = ev1.t_cpa - float(res_row.t_heard1)
     xsegs, xwins = [], []
@@ -222,8 +226,9 @@ def refine(sp, ev1, ev2, segs, res_row, spacing_m=50.0, half_m=400.0, harmonics=
         log(f"extra event at {ev.t_cpa:.0f} s: {segs[k].icao} (score {sc:.2f} at the candidate)")
         xsegs.append(segs[k]); xwins.append(EventWindow.from_fit(sp, ev, h, mode=score_mode))
     rows = []
+    hg = g.elev + (geoid(g.lat, g.lon) if geoid else 0.0)
     for i in range(len(g)):
-        obs = lla_to_enu(g.lat[i], g.lon[i], g.elev[i], res_row.lat0, res_row.lon0)
+        obs = lla_to_enu(g.lat[i], g.lon[i], hg[i], res_row.lat0, res_row.lon0)
         t_heard1 = cpa_from_trajectory(seg1.t, seg1.enu, obs, c=c, wind=wind)[1]
         tot, s1, s2, sh = locked_score(w1, w2, seg1, seg2, obs, float(t_heard1), c=c, wind=wind)
         t0_map = ev1.t_cpa - float(t_heard1)

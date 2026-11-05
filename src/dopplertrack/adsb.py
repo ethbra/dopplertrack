@@ -245,6 +245,23 @@ def load_many(paths) -> list[Trace]:
     return out
 
 
+def baro_to_ellipsoid(traces: list[Trace], undulation) -> int:
+    """Without a calibration, the best guess for a baro-only report's ellipsoidal height is
+    its pressure altitude (roughly height above mean sea level) plus the geoid undulation
+    under it. In place; returns the number of reports moved. Use this or calibrate_baro,
+    not both: calibrate_baro already maps baro onto the geometric (ellipsoidal) datum."""
+    n = 0
+    for tr in traces:
+        if tr.geom is None or tr.alt_baro is None:
+            continue
+        m = ~tr.geom & np.isfinite(tr.alt_baro) & ~tr.on_ground
+        if m.any():
+            tr.alt = tr.alt.copy()
+            tr.alt[m] = tr.alt_baro[m] + undulation(tr.lat[m], tr.lon[m])
+            n += int(m.sum())
+    return n
+
+
 def calibrate_baro(traces: list[Trace], bin_s: float = 1800.0, min_samples: int = 30,
                    max_alt_m: float = 6000.0) -> dict:
     """Put reports that only carry barometric altitude on the geometric datum, in place.

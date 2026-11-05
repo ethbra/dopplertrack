@@ -295,10 +295,23 @@ which worked from the full transcript and three screenshots;
 
 ### Added in this round, and what is and is not validated
 
-None of these changes the default behaviour, so every number in Results above is still what
-the defaults give. They are tested on synthetic data with known answers; none has yet been
-run on the two real recordings (the recordings are YouTube uploads and could not be
-downloaded where this was built), so on real data they are options to try, not defaults.
+One of these changes the default: the altitude datum (below), a correction rather than a
+model choice; `--no-geoid` restores the old behaviour, which is how the Results above were
+made. Everything else is opt-in. The flight-data side is checked on real ADS-B
+(`tests/test_real_adsb.py`, offline, and `tests/test_real_day.py` for a whole day); none of
+it has yet been run on the two real recordings, so the options that change the answer are
+not defaults until `tests/test_real_recordings.py` (see Validation below) says they help.
+
+- **Altitude datum (default on).** ADS-B geometric altitude is GNSS height above the WGS-84
+  ellipsoid; terrain tiles give height above mean sea level. The two differ by the geoid
+  undulation (about -33 m around New York, -28 m in south-west Florida), so every observer
+  sat that far too high relative to the aircraft. The sample trace in `tests/data` shows it
+  independently: its GNSS altitude minus its QNH-corrected pressure altitude is -32.2 m
+  (median of 1,025 reports) where EGM96 gives -33.6 m. Observers are now placed at terrain
+  height plus the EGM96 undulation (NGA, public domain, 2.7 MB, downloaded once from PROJ's
+  data repository), and baro-only aircraft get the same shift unless `--calibrate-baro`
+  maps them onto the GNSS datum directly. At Oyster Bay this moves the observer 32 m down,
+  which changes the King Air's 3.6 km slant range by about 9 m.
 
 - **`explain`.** The video's step-by-step panel for any flight, observer and reception time,
   including what the reception-time model would say. On the video's own numbers it gives
@@ -324,11 +337,21 @@ downloaded where this was built), so on real data they are options to try, not d
   (100 Hz tone, observer 4 km off the turn.) A 1.4 Hz error is as wide as the ridge score's
   whole 1.5 % tolerance, so this is the change most likely to matter on turning passes such
   as the faint N7681Y curve above. Real reports carry quantised and noisy speed and track,
-  so the gain on real data is smaller than this and has to be measured.
+  so the gain on real data is smaller: on the sample trace, predicting every other report
+  from the rest, the median horizontal error falls from 6.7 m to 4.7 m (in turns faster
+  than 0.5 deg/s, 7.4 to 4.4 m).
+
+  ("Hermite" is the name of the interpolation: a cubic between two points that matches both
+  the positions *and* the velocities given at them. Linear interpolation matches only the
+  positions, so the path has a corner, and the velocity a jump, at every report.)
 - **Baro datum** (`--calibrate-baro`). Geometric altitude is GNSS height; barometric altitude
   assumes a standard atmosphere and is off by tens of metres on any non-standard day (76 m on
   the test trace, QNH 1026 hPa). Aircraft that report both measure the offset; it is fitted per
-  half hour as a + b x baro and applied to aircraft that only report baro.
+  half hour as a + b x baro and applied to aircraft that only report baro. On the sample
+  trace, hiding one 10-minute block of GNSS altitude at a time: raw pressure altitude is 76 m
+  off, calibrated 0.8 m (median; 12 m at the 90th percentile). That calibrates the aircraft
+  from its own other blocks, which flatters it; `tests/test_real_day.py` does it across
+  aircraft.
 - **Weather** (`--temp`, `--wind SPEED FROM_DEG`, `--weather`). The speed of sound follows
   temperature (0.6 m/s per degree C). A uniform wind is modelled exactly: the sound heard at
   t_e + tau left when |D + w tau| = c tau (D from observer to aircraft), which gives
@@ -382,6 +405,34 @@ can be far enough off the real tone that the mask misses it (on the synthetic re
 scrubs whatever is still above chance, up to `--passes` more times. On that recording
 the risk went from high to medium after the first pass and to low after the second.
 
+## Validation
+
+| tests | data | runs |
+|---|---|---|
+| `test_physics`, `test_video_methods`, `test_countermeasures`, `test_pipeline_synthetic`, ... | synthetic, generated in the test | always |
+| `test_real_adsb` | the real readsb trace and an EGM96 crop in `tests/data` | always (offline) |
+| `test_real_day` | one real day of ADS-B over a region | `DOPPLERTRACK_DAY_TRACES=traces.npz` |
+| `test_oyster_bay`, `test_real_recordings` | the two recordings with known answers, and their days of ADS-B | `DOPPLERTRACK_OYSTER_BAY=dir`, `DOPPLERTRACK_SWFL=dir` |
+
+`test_real_recordings` searches +-3 km around each known answer under four option sets
+(the old baseline, the geoid, Hermite, Hermite with baro calibration) and asserts the right
+flight pair stays first and within 500 m; with `DOPPLERTRACK_REPORT=report.csv` it writes
+the peak distance, score and margin for each, which is the evidence for changing a default.
+Preparing the data (needs ffmpeg and yt-dlp; each day of ADS-B streams ~4 GB):
+
+```bash
+mkdir -p data/oyster_bay data/swfl
+yt-dlp -f bestaudio -o data/oyster_bay/rec.%(ext)s https://youtu.be/4CxVxuMVkMc
+uv run dopplertrack spectrogram data/oyster_bay/rec.* data/oyster_bay/rec.npz
+uv run dopplertrack fetch-day 2026-09-08 data/oyster_bay/traces_ny.npz --bbox 40.4 41.3 -74.4 -72.6
+yt-dlp -f bestaudio -o data/swfl/rec.%(ext)s https://youtu.be/zs2o5Rhlp5w
+uv run dopplertrack spectrogram data/swfl/rec.* data/swfl/rec.npz
+uv run dopplertrack fetch-day 2024-12-28 data/swfl/traces_swfl.npz --bbox 26.115 27.285 -82.505 -81.195
+DOPPLERTRACK_OYSTER_BAY=data/oyster_bay DOPPLERTRACK_SWFL=data/swfl \
+  DOPPLERTRACK_DAY_TRACES=data/oyster_bay/traces_ny.npz DOPPLERTRACK_REPORT=report.csv \
+  uv run pytest -s tests/test_real_recordings.py tests/test_real_day.py tests/test_oyster_bay.py
+```
+
 ## Changes from the method in the video
 
 The physics and the search strategy are the author's. What differs:
@@ -428,6 +479,7 @@ by flight geometry.
 | Aircraft engine class | OpenSky mirror of ICAO Doc 8643 |
 | Elevation | AWS Terrain Tiles (Terrarium) |
 | Weather (optional) | Open-Meteo ERA5 archive |
+| Geoid (sea level above the ellipsoid) | NGA EGM96 15', via PROJ-data on GitHub |
 
 ## Development
 
