@@ -1,6 +1,6 @@
 [project]
 name = "dopplertrack"
-version = "0.2.0"
+version = "0.3.0"
 description = "Acoustic geolocation from inaudible aircraft Doppler curves matched against ADS-B flight tracks"
 readme = "README.md"
 authors = [
